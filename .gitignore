@@ -1,0 +1,17 @@
+# ===== 红线：绝不入库 =====
+keygen_private.pem
+keygen.exe
+ghsmart-keygen.exe
+ghsmart-keygen.exe~
+build-keygen.bat
+cmd/keygen/
+cmd/keygen-gui/
+
+# ===== 构建产物 / 本地产物 =====
+build/
+.uitest/
+ghsmart_release/
+ghsmart_v1.0.0.zip
+ghsmart.exe
+ghsmart-keygen*
+*.log

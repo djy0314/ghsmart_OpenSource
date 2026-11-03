@@ -1,0 +1,18 @@
+{
+  "$schema": "https://wails.io/schemas/config.v2.json",
+  "name": "ghsmart",
+  "outputfilename": "ghsmart",
+  "frontend:install": "",
+  "frontend:build": "",
+  "frontend:dev:watcher": "",
+  "frontend:dev:serverUrl": "auto",
+  "author": {
+    "name": "ghsmart"
+  },
+  "info": {
+    "productName": "ghsmart",
+    "productVersion": "1.0.0",
+    "copyright": "Copyright © 2026",
+    "comments": "GitHub 访问智能优选（纯本地 DoH + 探测 + Hosts）"
+  }
+}

@@ -1,0 +1,780 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>ghsmart - GitHub 智能加速</title>
+  <style>
+    :root {
+      --bg: #0f172a; --panel: #1e293b; --panel2: #162032;
+      --line: #334155; --txt: #e2e8f0; --dim: #94a3b8;
+      --accent: #38bdf8; --ok: #34d399; --warn: #fbbf24; --err: #f87171;
+    }
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    html, body { height: 100%; }
+    body {
+      background: var(--bg); color: var(--txt);
+      font-family: "Segoe UI", "Microsoft YaHei", sans-serif;
+      display: flex; flex-direction: column; overflow: hidden; user-select: none;
+    }
+    header { padding: 14px 20px 10px; display: flex; align-items: center; gap: 10px; }
+    header .logo { width: 26px; height: 26px; }
+    header h1 { font-size: 16px; font-weight: 600; letter-spacing: .5px; }
+    header .ver { color: var(--dim); font-size: 11px; margin-left: auto; }
+
+    /* 状态展示区 */
+    #status-bar {
+      margin: 0 20px; padding: 10px 14px; border-radius: 10px;
+      background: var(--panel2); border: 1px solid var(--line);
+      display: flex; align-items: center; gap: 10px; font-size: 14px;
+    }
+    #status-dot { width: 10px; height: 10px; border-radius: 50%; background: var(--dim); flex: none; transition: background .3s; }
+    #status-text.busy { animation: textPulse 1.2s ease-in-out infinite; }
+    @keyframes textPulse { 0%,100% { opacity: 1; } 50% { opacity: .45; } }
+    #status-dot.busy { background: var(--warn); animation: pulse 1s infinite; }
+    #status-dot.warn { background: var(--warn); }
+    #status-dot.ok { background: var(--ok); }
+    #status-dot.err { background: var(--err); }
+    #admin-badge { display: none; margin-left: 8px; padding: 1px 8px; border-radius: 8px; font-size: 11px; color: var(--ok); border: 1px solid var(--ok); }
+    @keyframes pulse { 50% { opacity: .35; } }
+    #applied-info { margin-left: auto; color: var(--dim); font-size: 12px; }
+
+    main { flex: 1; display: flex; flex-direction: column; padding: 14px 20px 16px; gap: 12px; min-height: 0; }
+
+    /* 核心操作区 */
+    #go-btn {
+      width: 100%; padding: 16px; font-size: 18px; font-weight: 700; letter-spacing: 2px;
+      color: #052e22; background: linear-gradient(135deg, #34d399, #10b981);
+      border: none; border-radius: 12px; cursor: pointer; transition: filter .15s, transform .05s;
+    }
+    #go-btn:hover:not(:disabled) { filter: brightness(1.1); }
+    #go-btn:active:not(:disabled) { transform: scale(.99); }
+    #go-btn:disabled { filter: grayscale(.7) brightness(.7); cursor: not-allowed; }
+
+    #results {
+      flex: 1; min-height: 0; overflow-y: auto; border: 1px solid var(--line);
+      border-radius: 10px; background: var(--panel2); padding: 10px;
+      font-family: Consolas, "Courier New", monospace; font-size: 12.5px;
+    }
+    #results .placeholder { color: var(--dim); text-align: center; padding: 40px 0; font-family: inherit; }
+    .dom-title { color: var(--accent); font-weight: 700; margin: 8px 4px 4px; }
+    .dom-title .skipped { color: var(--warn); font-weight: 400; }
+    table.probe { width: 100%; border-collapse: collapse; margin-bottom: 6px; }
+    table.probe th { color: var(--dim); font-weight: 400; text-align: left; padding: 2px 6px; border-bottom: 1px solid var(--line); }
+    table.probe td { padding: 2px 6px; }
+    table.probe tr.ok td { color: var(--txt); }
+    table.probe tr.fail td { color: #64748b; text-decoration-color: #475569; }
+    table.probe td.best { color: var(--ok); font-weight: 700; }
+    .row-note { color: var(--dim); padding: 0 4px 8px; }
+
+    /* 清理与还原区 + Pro 区 */
+    .bottom-row { display: flex; gap: 12px; align-items: stretch; }
+    .pro-col { flex: 1; display: flex; flex-direction: column; gap: 8px; min-width: 0; }
+    #restore-btn {
+      flex: 1; padding: 12px; font-size: 14px; color: var(--err);
+      background: transparent; border: 1px solid var(--err); border-radius: 10px; cursor: pointer;
+    }
+    #restore-btn:hover { background: rgba(248,113,113,.08); }
+    .pro-box {
+      flex: 1; display: flex; align-items: center; gap: 10px; padding: 12px 14px;
+      background: var(--panel2); border: 1px solid var(--line); border-radius: 10px; cursor: pointer;
+    }
+    .pro-box .switch { width: 38px; height: 20px; border-radius: 10px; background: var(--line); position: relative; flex: none; }
+    .pro-box .switch::after { content: ""; position: absolute; width: 16px; height: 16px; border-radius: 50%; background: var(--dim); top: 2px; left: 2px; }
+    .pro-box .label { font-size: 13px; }
+    .pro-box .lock { margin-left: auto; font-size: 15px; }
+    .pro-box.disabled { opacity: .75; }
+
+    /* 确认弹窗：始终 flex 常驻，用透明度过渡显隐，
+       避免 display 翻转瞬间触发的整页重绘「闪一下」 */
+    #modal-mask, #pro-mask {
+      position: fixed; inset: 0; background: rgba(0,0,0,.6);
+      display: flex; align-items: center; justify-content: center; z-index: 50;
+      opacity: 0; visibility: hidden; transition: opacity .15s, visibility .15s;
+    }
+    #modal-mask.show, #pro-mask.show { opacity: 1; visibility: visible; }
+    #modal {
+      width: 380px; background: var(--panel); border: 1px solid var(--line);
+      border-radius: 12px; padding: 22px; text-align: center;
+    }
+    #modal p { margin-bottom: 18px; font-size: 14px; line-height: 1.6; }
+    #modal .btns { display: flex; gap: 12px; }
+    #modal button { flex: 1; padding: 9px; border-radius: 8px; font-size: 13px; cursor: pointer; border: none; }
+    #modal .yes { background: var(--err); color: #fff; }
+    #modal .no { background: var(--line); color: var(--txt); }
+
+    /* 深度加速模式选择弹窗（纯 HTML 自绘，不用系统对话框） */
+    #mode-mask {
+      position: fixed; inset: 0; background: rgba(0,0,0,.6);
+      display: flex; align-items: center; justify-content: center; z-index: 55;
+      opacity: 0; visibility: hidden; transition: opacity .15s, visibility .15s;
+    }
+    #mode-mask.show { opacity: 1; visibility: visible; }
+    #mode-mask .card {
+      width: 470px; background: var(--panel); border: 1px solid var(--line);
+      border-radius: 12px; padding: 22px;
+    }
+    #mode-mask h3 { font-size: 15px; margin-bottom: 14px; }
+    .mode-opt {
+      display: flex; gap: 10px; padding: 12px; margin-bottom: 10px;
+      border: 1px solid var(--line); border-radius: 10px; cursor: pointer;
+      transition: border-color .15s, background .15s;
+    }
+    .mode-opt.sel { border-color: var(--accent); background: rgba(56,189,248,.06); }
+    .mode-opt input { margin-top: 3px; accent-color: var(--accent); flex: none; }
+    .mode-opt .t { display: block; font-size: 13px; font-weight: 600; }
+    .mode-opt .d { display: block; font-size: 11.5px; color: var(--dim); line-height: 1.6; margin-top: 4px; }
+    #mode-mask .btns { display: flex; gap: 12px; margin-top: 6px; }
+    #mode-mask button { flex: 1; padding: 9px; border-radius: 8px; font-size: 13px; cursor: pointer; border: none; }
+    #mode-mask .go { background: var(--accent); color: #06283d; font-weight: 600; }
+    #mode-mask .cancel { background: var(--line); color: var(--txt); }
+    #mode-mask button:disabled { opacity: .5; cursor: not-allowed; }
+
+    /* 分组标题：上面必选二选一，下面可选附加开关，防呆防误解 */
+    .grp-title {
+      font-size: 11.5px; color: var(--dim); font-weight: 600;
+      letter-spacing: .05em; margin: 2px 0 8px;
+    }
+    .grp-title .grp-need { font-weight: 400; color: var(--dim); }
+    .grp-box { margin-bottom: 12px; }
+    .grp-box .mode-opt:last-child { margin-bottom: 0; }
+
+    /* 兼容模式勾选行（公司 VPN 场景）：整行 label，点哪都能切换 */
+    .compat-row {
+      display: flex; gap: 10px; padding: 12px; margin-bottom: 10px;
+      border: 1px dashed var(--warn); border-radius: 10px; cursor: pointer;
+      transition: background .15s;
+    }
+    .compat-row:hover { background: rgba(251,191,36,.05); }
+    .compat-row:has(input:checked) { background: rgba(251,191,36,.08); }
+    .compat-row input { margin-top: 3px; accent-color: var(--warn); flex: none; cursor: pointer; }
+    .compat-row .t { display: block; font-size: 13px; font-weight: 600; }
+    .compat-row .d { display: block; font-size: 11.5px; color: var(--dim); line-height: 1.6; margin-top: 4px; }
+
+    /* Toast：常驻布局，透明度过渡，单实例互斥 */
+    #toast {
+      position: fixed; bottom: 24px; left: 50%; transform: translateX(-50%) translateY(12px);
+      background: var(--panel); color: var(--txt); border: 1px solid var(--line);
+      padding: 10px 18px; border-radius: 8px; font-size: 13px; opacity: 0;
+      transition: opacity .2s, transform .2s; z-index: 60; max-width: 80%;
+      pointer-events: none; visibility: hidden;
+    }
+    #toast.show { transform: translateX(-50%) translateY(0); opacity: 1; visibility: visible; }
+    #toast.err { border-color: var(--err); color: var(--err); }
+    #toast.ok { border-color: var(--ok); color: var(--ok); }
+    #toast.warn { border-color: var(--warn); color: var(--warn); }
+
+    /* Pro 解锁弹窗 */
+    #pro-mask .pro-card {
+      width: 420px; background: var(--panel); border: 1px solid var(--line);
+      border-radius: 12px; padding: 22px;
+    }
+    #pro-mask h3 { font-size: 15px; margin-bottom: 8px; }
+    #pro-mask .hint { color: var(--dim); font-size: 12px; line-height: 1.6; margin-bottom: 14px; }
+    .mc-row {
+      display: flex; align-items: center; gap: 8px; margin-bottom: 14px;
+      padding: 9px 12px; background: var(--panel2); border: 1px dashed var(--line); border-radius: 8px;
+    }
+    .mc-row .mc-label { font-size: 12px; color: var(--dim); flex: none; }
+    .mc-row code { font-family: Consolas, monospace; font-size: 13px; color: var(--accent); letter-spacing: 1px; }
+    .mc-row button {
+      margin-left: auto; flex: none; padding: 4px 12px; font-size: 12px; cursor: pointer;
+      background: var(--line); color: var(--txt); border: none; border-radius: 6px;
+    }
+    .mc-row button:hover { filter: brightness(1.2); }
+    #pro-key {
+      width: 100%; padding: 10px 12px; background: var(--panel2); color: var(--txt);
+      border: 1px solid var(--line); border-radius: 8px; font-size: 13px;
+      font-family: Consolas, monospace; outline: none; margin-bottom: 14px;
+    }
+    #pro-key:focus { border-color: var(--accent); }
+    #pro-msg { min-height: 18px; font-size: 12px; margin-bottom: 10px; }
+    #pro-msg.err { color: var(--err); }
+    #pro-msg.ok { color: var(--ok); }
+    #pro-mask .btns { display: flex; gap: 12px; }
+    #pro-mask button { flex: 1; padding: 9px; border-radius: 8px; font-size: 13px; cursor: pointer; border: none; }
+    #pro-mask .go { background: var(--accent); color: #06283d; font-weight: 600; }
+    #pro-mask .cancel { background: var(--line); color: var(--txt); }
+    #pro-mask button:disabled { opacity: .5; cursor: not-allowed; }
+
+    /* 滑块位置只跟「自愈是否开启」绑定（.healing），
+       绝对不能绑在 .unlocked 上——否则 Pro 一解锁滑块就永远停在右边，
+       用户点关闭看起来仍是开启状态（上一版就是这个 bug）。
+       深度加速用独立的 .on 类，两套状态互不干扰。 */
+    .pro-box.unlocked .switch { background: #475569; }
+    .pro-box.unlocked .switch::after { left: 2px; background: #cbd5e1; }
+    .pro-box.healing .switch, .pro-box.on .switch { background: var(--ok); }
+    .pro-box.healing .switch::after, .pro-box.on .switch::after { left: 20px; background: #052e22; }
+    .pro-box.unlocked { cursor: pointer; }
+    .pro-box .state-txt { font-size: 11px; color: var(--dim); margin-left: 4px; white-space: nowrap; }
+    .pro-box.healing .state-txt, .pro-box.on .state-txt { color: var(--ok); }
+    .pro-box .spin { display: none; font-size: 11px; color: var(--dim); }
+    .pro-box.healing .spin { display: inline; }
+    .pro-box .label { white-space: nowrap; }
+
+    /* 清除授权：右上角极小的文本按钮 */
+    #clear-lic {
+      padding: 2px 8px; margin-left: 6px; font-size: 10px; cursor: pointer;
+      color: var(--dim); background: transparent;
+      border: 1px solid var(--line); border-radius: 6px;
+    }
+    #clear-lic:hover { color: var(--err); border-color: var(--err); }
+  </style>
+</head>
+<body>
+  <header>
+    <svg class="logo" viewBox="0 0 512 512"><rect x="16" y="16" width="480" height="480" rx="96" fill="#0f172a" stroke="#38bdf8" stroke-width="12"/><polygon points="300,60 170,270 250,270 200,452 360,230 270,230 330,60" fill="#34d399"/></svg>
+    <h1>ghsmart</h1>
+    <span class="ver" id="ver-text">Free v1.0.0 · 纯本地加速</span>
+    <button id="clear-lic" type="button" title="删除本地授权文件并回到 Free 状态（测试用）">清除授权</button>
+  </header>
+
+  <div id="status-bar">
+    <span id="status-dot"></span><span id="status-text">就绪</span>
+    <span id="admin-badge">管理员权限</span>
+    <span id="applied-info"></span>
+  </div>
+
+  <main>
+    <!-- 核心操作区 -->
+    <button id="go-btn">🚀 一键智能加速</button>
+    <div id="results">
+      <div class="placeholder">点击上方按钮开始探测，实时结果将在这里滚动显示</div>
+    </div>
+
+    <!-- 清理与还原区 + 高级预留 -->
+    <div class="bottom-row">
+      <button id="restore-btn" title="清 Hosts 区块 + 仅还原我们接管过的系统代理 + 停用自愈（对所有用户开放）">🧹 一键还原网络</button>
+      <div class="pro-col">
+        <div class="pro-box disabled" id="pro-toggle" title="Pro 功能：后台按间隔自动巡检，剔除失效 IP">
+          <div class="switch"></div>
+          <span class="label">⚡ 后台自动自愈 (Pro)</span>
+          <span class="state-txt" id="heal-state"></span>
+          <span class="lock">🔒</span>
+        </div>
+        <div class="pro-box disabled" id="deep-toggle" title="Pro 功能：本地 TLS 分片代理，绕过 SNI 阻断（无需安装任何证书）">
+          <div class="switch"></div>
+          <span class="label">🌐 深度网页加速 (Pro)</span>
+          <span class="state-txt" id="deep-state"></span>
+          <span class="lock">🔒</span>
+        </div>
+      </div>
+    </div>
+  </main>
+
+  <div id="modal-mask">
+    <div id="modal">
+      <p>确定要一键还原网络吗？<br/>
+        <span style="color:var(--dim);font-size:12px;">
+          · 清除 Hosts 里的 ghsmart 区块，被注释的冲突行原样恢复<br/>
+          · 若系统代理指向 127.0.0.1:18080 则还原。/ 第三方代理（如 Clash 7890）绝不会被改动<br/>
+          · 关闭深度加速与后台自愈，其他内容不受影响
+        </span>
+      </p>
+      <div class="btns">
+        <button class="no" id="modal-no">取消</button>
+        <button class="yes" id="modal-yes">确定还原</button>
+      </div>
+    </div>
+  </div>
+
+  <div id="mode-mask">
+    <div class="card">
+      <h3>请选择加速模式</h3>
+      <div class="grp-title">代理生效方式<span class="grp-need">（必选其一）</span></div>
+      <div class="grp-box" id="mode-group">
+        <label class="mode-opt sel" id="mode-auto">
+          <input type="radio" name="deepmode" value="auto" checked/>
+          <span>
+            <span class="t">自动模式（推荐）</span>
+            <span class="d">一键接管系统代理（127.0.0.1:18080），全自动生效。关闭软件时自动恢复，若使用 Clash 等软件可能冲突。</span>
+          </span>
+        </label>
+        <label class="mode-opt" id="mode-manual">
+          <input type="radio" name="deepmode" value="manual"/>
+          <span>
+            <span class="t">手动模式（进阶）</span>
+            <span class="d">仅启动本地代理端口，不修改任何注册表。适合进阶用户配合浏览器插件使用。</span>
+          </span>
+        </label>
+      </div>
+      <div class="grp-title">附加选项</div>
+      <!-- 整行都是 label：点击黄色虚线框内任意位置均可切换勾选（防呆） -->
+      <label class="compat-row" id="compat-row">
+        <input type="checkbox" id="compat-check"/>
+        <span>
+          <span class="t">为 VPN 环境开启兼容隧道（可选）</span>
+          <span class="d">如果您在公司内网使用深信服等 VPN，请勾选此项。它会关闭高级分片特性，防止被 VPN 拦截断网。</span>
+        </span>
+      </label>
+      <div class="btns">
+        <button class="cancel" id="mode-cancel">取消</button>
+        <button class="go" id="mode-ok">确定开启</button>
+      </div>
+    </div>
+  </div>
+
+  <div id="pro-mask">
+    <div class="pro-card">
+      <h3>⚡ 解锁 Pro · 高级加速功能</h3>
+      <p class="hint">Pro 版包含：<b>后台自动自愈</b>（按配置间隔自动巡检优选 IP、剔除失效记录）与
+        <b>深度网页加速</b>（本地 TLS 分片代理，绕过 SNI 阻断，无需安装任何证书）。<br/>
+        把下面的<b>机器码</b>发给开发者换取激活码，粘贴后点击「验证并解锁」。全程离线验签，无需联网。</p>
+      <div class="mc-row">
+        <span class="mc-label">本机机器码</span>
+        <code id="mc-code" title="发送此机器码给开发者">读取中...</code>
+        <button id="mc-copy" type="button">复制</button>
+      </div>
+      <input id="pro-key" type="text" placeholder="粘贴激活码（112 位）" autocomplete="off"/>
+      <div id="pro-msg"></div>
+      <div class="btns">
+        <button class="cancel" id="pro-cancel">取消</button>
+        <button class="go" id="pro-go">验证并解锁</button>
+      </div>
+    </div>
+  </div>
+
+  <div id="toast"></div>
+
+  <script>
+    // ===== 基础引用 =====
+    const { EventsOn } = window.runtime;
+    const app = window.go.main.App;
+    const $ = (id) => document.getElementById(id);
+    const dot = $("status-dot"), statusText = $("status-text");
+    const results = $("results"), goBtn = $("go-btn");
+    let toastTimer = null, lastToast = "";
+
+    // Toast：单实例互斥（timer 重置），同文案 1.5 秒内去重，杜绝连续触发造成的闪跳
+    function toast(msg, type) {
+      const t = $("toast");
+      const now = Date.now();
+      if (msg === lastToast && t.classList.contains("show") && now - (toast.stamp || 0) < 1500) return;
+      toast.stamp = now; lastToast = msg;
+      t.textContent = msg;
+      t.className = "show " + (type || "");
+      clearTimeout(toastTimer);
+      toastTimer = setTimeout(() => t.className = "", 3000);
+    }
+
+    // 状态单点更新：text + cls 一次到位（后端在同一个事件里给出两者，
+    // 避免「applied 设绿、紧接的 status 又改黄」的来回闪跳）
+    function setStatus(text, cls) {
+      statusText.textContent = text;
+      dot.className = cls || "";
+      statusText.classList.toggle("busy", cls === "busy");
+    }
+
+    // 一键加速按钮的忙碌态：禁用 + 文案换成动态提示（绝不看起来像个死物）
+    const GO_LABEL = "🚀 一键智能加速";
+    function setGoBusy(busy) {
+      goBtn.disabled = busy;
+      goBtn.textContent = busy ? "正在探测，请稍候..." : GO_LABEL;
+    }
+
+    // 结果区整块替换用 replaceChildren（innerHTML 置空会造成瞬间空白区）
+    function resetResults(placeholderText) {
+      const div = document.createElement("div");
+      div.className = "placeholder";
+      div.textContent = placeholderText || "";
+      results.replaceChildren(div);
+    }
+
+    function setAppliedInfo(n) {
+      $("applied-info").textContent = n > 0 ? `当前生效: ${n} 条加速记录` : "当前未加速";
+    }
+
+    // ===== Pro 状态渲染（唯一入口：后端返回值 / engine:state 事件）=====
+    // 注意：$ 是 getElementById（只认 id）！CSS 选择器必须用 querySelector，
+    // 否则恒返回 null，一设 textContent 就抛
+    // 「TypeError: Cannot set properties of null (setting 'textContent')」
+    function renderState(s) {
+      const box = $("pro-toggle");
+      const deep = $("deep-toggle");
+      if (!box || !deep) return; // DOM 未就绪时直接放弃本次渲染，等下一次事件
+      const lock = box.querySelector(".lock");
+      const deepLock = deep.querySelector(".lock");
+      const healTxt = $("heal-state");
+      const deepTxt = $("deep-state");
+      const verTxt = $("ver-text");
+      if (s.pro) {
+        box.classList.add("unlocked");
+        box.classList.remove("disabled");
+        deep.classList.add("unlocked");
+        deep.classList.remove("disabled");
+        // 锁图标只表示「未解锁」；两个开关各由 healing / on 类驱动滑块位置
+        if (lock) lock.textContent = "";
+        if (deepLock) deepLock.textContent = "";
+        if (healTxt) healTxt.textContent = s.autoHeal ? "已开启" : "已关闭";
+        if (deepTxt) {
+          deepTxt.textContent = !s.deepAccel
+            ? "已关闭"
+            : (s.deepMode === "manual" ? "已开启 · 手动" : "已开启") + (s.deepCompat ? " · 兼容" : "");
+        }
+        box.classList.toggle("healing", !!s.autoHeal);
+        deep.classList.toggle("on", !!s.deepAccel);
+        // 监听地址放 title，避免在窄框里挤成一团
+        if (s.deepAccel) {
+          deep.title = (s.deepMode === "manual"
+            ? "手动模式：本地代理 " + s.deepListen + "（未改系统代理，请用插件/命令行指向它）"
+            : "自动模式：系统代理 → " + s.deepListen + "（TLS 分片绕过 SNI 阻断）")
+            + (s.deepCompat ? "。兼容模式：不做分片，纯隧道（公司 VPN 环境）" : "");
+        } else {
+          deep.title = "Pro 功能：本地 TLS 分片代理，绕过 SNI 阻断（无需安装任何证书）。公司 VPN（深信服 aTrust 等）环境请勾选兼容模式，或仅使用一键智能加速";
+        }
+        if (verTxt) verTxt.textContent = "Pro v1.0.0 · 已授权";
+      } else {
+        box.classList.remove("unlocked", "healing");
+        deep.classList.remove("unlocked", "on");
+        box.classList.add("disabled");
+        deep.classList.add("disabled");
+        if (lock) lock.textContent = "🔒";
+        if (deepLock) deepLock.textContent = "🔒";
+        if (healTxt) healTxt.textContent = "";
+        if (deepTxt) deepTxt.textContent = "";
+        if (verTxt) verTxt.textContent = "Free v1.0.0 · 纯本地加速";
+      }
+    }
+
+    // ===== 事件绑定（IIFE + 标记，保证整个生命周期只绑一次）=====
+    (function bindEvents() {
+      if (bindEvents.done) return;
+      bindEvents.done = true;
+
+      EventsOn("engine:status", (s) => {
+        if (s && typeof s === "object") setStatus(s.text, s.cls);
+        else setStatus(String(s), "busy"); // 兼容旧格式
+      });
+
+      EventsOn("engine:warn", (msg) => toast(msg, "warn"));
+
+      EventsOn("engine:state", (s) => renderState(s));
+
+      EventsOn("engine:domain", (d) => {
+        const ph = results.querySelector(".placeholder");
+        if (ph) ph.remove();
+        if (d.phase === "start") {
+          const t = document.createElement("div");
+          t.className = "dom-title";
+          t.textContent = `▸ 正在探测 ${d.domain} ...`;
+          t.dataset.domain = d.domain;
+          results.appendChild(t);
+          results.scrollTop = results.scrollHeight;
+          return;
+        }
+        if (d.phase === "skipped") {
+          const t = results.querySelector(`[data-domain="${d.domain}"]`);
+          if (t) t.innerHTML = `▸ ${d.domain} <span class="skipped">已跳过（无可用IP，已从 Hosts 剔除旧记录）</span>`;
+          results.scrollTop = results.scrollHeight;
+          return;
+        }
+        // phase === "result"
+        const t = results.querySelector(`[data-domain="${d.domain}"]`);
+        if (t) t.textContent = `▸ ${d.domain}  ${d.best ? "Best: " + d.best : "无可用 IP"}`;
+        const tbl = document.createElement("table");
+        tbl.className = "probe";
+        tbl.innerHTML = "<tr><th>IP</th><th>TCP(ms)</th><th>TLS(ms)</th><th>HTTP(ms)</th><th>Score</th><th>状态</th></tr>" +
+          d.rows.map((r) =>
+            `<tr class="${r.ok ? "ok" : "fail"}">` +
+            `<td class="${r.chosen ? "best" : ""}">${r.ip}${r.chosen ? " ★" : ""}</td>` +
+            `<td>${r.tcp}</td><td>${r.tls}</td><td>${r.http}</td>` +
+            `<td>${r.score.toFixed(1)}</td>` +
+            `<td>${r.ok ? "✓" : "✗ 不可达"}</td></tr>`
+          ).join("");
+        results.appendChild(tbl);
+        const note = document.createElement("div");
+        note.className = "row-note";
+        note.textContent = d.best ? `已为 ${d.domain} 选用 ${d.best}` : "";
+        results.appendChild(note);
+        results.scrollTop = results.scrollHeight;
+      });
+
+      EventsOn("engine:cache", (d) => {
+        // 缓存秒应用：加速已立刻生效，按钮保持禁用直到后台校验完成（engine:applied）
+        setAppliedInfo(d.written || 0);
+        setStatus("加速已生效（缓存秒应用，后台校验更优 IP 中...）", "ok");
+        toast(`⚡ 已用缓存秒开加速（${d.written} 条），正在后台校验更优 IP...`, "ok");
+      });
+
+      EventsOn("engine:primary", () => {
+        // 主域名（github.com）提前生效：不等其余域名探测完
+        setStatus("加速已生效（主域名已生效，其余域名后台优化中...）", "ok");
+        toast("⚡ 加速已生效（github.com 已通），其余域名后台继续优化中...", "ok");
+      });
+
+      EventsOn("engine:cacheupdated", (d) => {
+        // 后台静默校验发现更优 IP：替换已完成，只提示一次
+        const list = (d.updated || []).map((u) => `${u.domain}: ${u.from} → ${u.to}`).join("；");
+        setStatus("已为您更新更优 IP", "ok");
+        toast(`已为您更新更优 IP（${d.updated.length} 条）：${list}`, "ok");
+      });
+
+      EventsOn("engine:applied", (d) => {
+        setGoBusy(false);
+        const written = d.written || 0;
+        if (d.entries) setAppliedInfo(Object.keys(d.entries).length);
+        else if (written > 0) $("applied-info").textContent = `已写入: ${written} 条加速记录`;
+        else setAppliedInfo(0);
+        if (!d.ok) {
+          setStatus("加速失败: " + d.error, "err");
+          toast(d.error, "err");
+        } else if (written > 0) {
+          setStatus("加速已生效", "ok");
+          const updated = d.updated || [];
+          if (updated.length > 0) {
+            const list = updated.map((u) => `${u.domain}: ${u.from} → ${u.to}`).join("；");
+            toast(`已为您更新更优 IP（${updated.length} 条）：${list}。若网页仍打不开，请按 Ctrl+F5 强制刷新或重启浏览器。`, "ok");
+          } else {
+            // 小白保命提示：浏览器/DNS 有自己的缓存，Hosts 生效不代表网页立刻能开
+            toast(`加速成功，Hosts 已更新（${written} 条）。加速已生效。若网页仍打不开，请按 Ctrl+F5 强制刷新或重启浏览器。`, "ok");
+          }
+        } else {
+          setStatus("本轮未写入任何加速记录（全部域名不可用）", "warn");
+          toast("本轮所有域名均不可用，Hosts 中的失效记录已清除", "warn");
+        }
+      });
+
+      // 托盘里的「恢复 Hosts」路径：窗口看不见时还原完成，靠这个事件同步界面
+      EventsOn("engine:removed", () => {
+        setGoBusy(false);
+        setStatus("已安全还原", "ok");
+        setAppliedInfo(0);
+        toast("已安全还原", "ok");
+        resetResults("点击「一键智能加速」重新开始");
+      });
+
+      // 受限网络（所有 IP 均未通过真实业务校验，典型：公司 VPN 全量 RST）
+      EventsOn("engine:netrestricted", () => {
+        setGoBusy(false);
+        setStatus("当前网络环境受限（如公司 VPN），无法通过修改 Hosts 加速。", "err");
+        setAppliedInfo(0);
+        toast("⚠ 检测到严重网络限制，无法为您加速。请检查是否开启了公司 VPN 或安全软件。", "err");
+        resetResults("无效的 Hosts 记录已清理。解除限制后可重新点击加速。");
+      });
+
+      // 自动避让（Auto-Fallback）：代理连续全败 → 后端已自动关闭深度加速
+      EventsOn("deep:autofallback", (d) => {
+        renderState(d && d.state);
+        setStatus("深度加速已自动关闭（网络环境受限）", "warn");
+        toast("🛡 检测到当前网络环境（如公司 VPN）拦截了加速流量，已为您自动关闭深度加速，防止网页卡死。"
+          + "「一键智能加速」（Hosts 模式）不受影响，可正常使用。", "warn");
+      });
+    })();
+
+    // ===== 启动初始化 =====
+    app.IsElevated().then((v) => { if (v) $("admin-badge").style.display = "inline"; });
+    app.GetAppliedEntries().then((m) => {
+      const n = Object.keys(m || {}).length;
+      setAppliedInfo(n);
+      if (n > 0) setStatus("加速已生效", "ok");
+    });
+    app.GetProState().then(renderState);
+
+    // ===== 一键加速 =====
+    goBtn.addEventListener("click", async () => {
+      try {
+        setGoBusy(true);
+        resetResults();
+        setStatus("正在探测，请稍候...", "busy");
+        await app.StartApply();
+      } catch (e) {
+        setGoBusy(false);
+        setStatus("加速失败", "err");
+        toast(String(e), "err");
+      }
+    });
+
+    // ===== 恢复 Hosts：严格二次确认（自绘 Modal，无原生弹窗）=====
+    const mask = $("modal-mask");
+    $("restore-btn").addEventListener("click", () => mask.classList.add("show"));
+    $("modal-no").addEventListener("click", () => mask.classList.remove("show"));
+    $("modal-yes").addEventListener("click", async () => {
+      mask.classList.remove("show");
+      try {
+        await app.RemoveHosts();
+      } catch (e) {
+        toast(String(e), "err");
+        setStatus("还原失败", "err");
+      }
+      // 成功路径由 engine:removed 事件统一渲染（含托盘触发），避免双写状态
+    });
+
+    // ===== Pro：解锁模态框 + 开关 =====
+    const proMask = $("pro-mask");
+    let mcCopied = "";
+
+    // 打开解锁弹窗（仅在未激活时使用），顺带拉一次机器码
+    function openProModal() {
+      proMask.classList.add("show");
+      app.GetMachineCode().then((mc) => {
+        $("mc-code").textContent = mc;
+        mcCopied = mc;
+      }).catch((e) => { $("mc-code").textContent = "读取失败: " + e; });
+      $("pro-key").focus();
+    }
+
+    $("pro-toggle").addEventListener("click", async () => {
+      try {
+        const st = await app.GetProState();
+        if (!st.pro) {
+          openProModal();
+          return;
+        }
+        // 以「后端当前状态取反」为目标，并用后端返回值渲染，
+        // 不做任何本地状态猜测——这是开关能可靠关闭的前提
+        const next = !st.autoHeal;
+        const st2 = await app.SetAutoHeal(next);
+        renderState(st2);
+        toast(st2.autoHeal ? "⚡ 后台自动自愈已开启" : "后台自动自愈已关闭", "ok");
+      } catch (e) {
+        toast(String(e), "err");
+      }
+    });
+    // ===== 深度网页加速（Pro）：双模式（自动接管 / 仅开端口）=====
+    // 点开关不立即执行：先弹「请选择加速模式」，用上次的选择做默认值。
+    // 关闭时不需要弹窗，直接关并精准还原系统代理。
+    const modeMask = $("mode-mask");
+    let deepBusy = false;
+    let pendingMode = "auto";
+
+    function syncModeUI() {
+      $("mode-auto").classList.toggle("sel", pendingMode === "auto");
+      $("mode-manual").classList.toggle("sel", pendingMode === "manual");
+      const el = document.querySelector('input[name="deepmode"][value="' + pendingMode + '"]');
+      if (el) el.checked = true;
+    }
+
+    function openModeModal(lastMode, compatDefault) {
+      pendingMode = lastMode === "manual" ? "manual" : "auto";
+      // 兼容模式默认不勾选，只有配置文件 web_proxy.compat_mode 设了默认开启才勾
+      const cc = $("compat-check");
+      if (cc) cc.checked = !!compatDefault;
+      syncModeUI();
+      modeMask.classList.add("show");
+    }
+
+    $("mode-auto").addEventListener("click", () => { pendingMode = "auto"; syncModeUI(); });
+    $("mode-manual").addEventListener("click", () => { pendingMode = "manual"; syncModeUI(); });
+    $("mode-cancel").addEventListener("click", () => modeMask.classList.remove("show"));
+
+    $("mode-ok").addEventListener("click", async () => {
+      if (deepBusy) return;
+      const mode = pendingMode;
+      const compat = !!( $("compat-check") && $("compat-check").checked );
+      deepBusy = true;
+      $("mode-ok").disabled = true;
+      setStatus(mode === "auto" ? "正在接管系统代理..." : "正在启动本地代理...", "busy");
+      try {
+        const st2 = await app.SetDeepAccel(true, mode, compat);
+        modeMask.classList.remove("show");
+        renderState(st2);
+        // bypass 清理是 ERR_CONNECTION_CLOSED 的根因修复，清理了多少必须让用户看见
+        const removed = (st2 && st2.bypassRemoved) ? st2.bypassRemoved.length : 0;
+        setStatus("深度加速已开启" + (compat ? "（兼容模式）" : "") + (removed ? "（已清理 " + removed + " 条代理例外）" : ""), "ok");
+        if (compat) {
+          toast("🌐 已开启（兼容模式：不分片，纯隧道，适配公司 VPN）" + (removed ? "，并清理 " + removed + " 条代理例外" : ""), "ok");
+        } else if (mode === "auto") {
+          toast(removed
+            ? "🌐 已接管系统代理，并清理 " + removed + " 条 GitHub 代理例外"
+            : "🌐 已开启并接管系统代理（代理例外列表已干净）", "ok");
+        } else {
+          toast("🌐 已开启本地代理（手动模式，未改系统代理）", "ok");
+        }
+      } catch (e) {
+        toast(String(e), "err");
+        setStatus("深度加速开启失败", "err");
+        // 失败时以后端真实状态为准，避免界面比后端乐观
+        try { renderState(await app.GetProState()); } catch (_) {}
+      } finally {
+        deepBusy = false;
+        $("mode-ok").disabled = false;
+      }
+    });
+
+    $("deep-toggle").addEventListener("click", async () => {
+      if (deepBusy) return;
+      try {
+        const st = await app.GetProState();
+        if (!st.pro) {
+          openProModal();
+          return;
+        }
+        if (st.deepAccel) {
+          deepBusy = true;
+          setStatus("正在关闭并还原系统代理...", "busy");
+          const st2 = await app.SetDeepAccel(false, st.deepMode || "auto", !!st.deepCompat);
+          renderState(st2);
+          setStatus("深度加速已关闭", "ok");
+          toast("深度网页加速已关闭，系统代理已还原", "ok");
+          return;
+        }
+        // 开启前预检：上一轮探测显示主域名全部 IP 不可达 → 直接拦截，不弹模式窗
+        try {
+          const pc = await app.CheckDeepPrecondition();
+          if (pc && pc.ok === false) {
+            setStatus("深度加速被预检拦截", "warn");
+            toast("🚫 " + pc.reason, "warn");
+            return;
+          }
+        } catch (_) { /* 预检失败不挡路，后端 SetDeepAccel 还有同款闸 */ }
+        openModeModal(st.deepMode, st.deepCompatDefault); // 兼容默认取配置文件
+      } catch (e) {
+        toast(String(e), "err");
+        setStatus("深度加速切换失败", "err");
+        try { renderState(await app.GetProState()); } catch (_) {}
+      } finally {
+        deepBusy = false;
+      }
+    });
+
+    // 复制机器码（Clipboard API 不可用时退回 execCommand）
+    $("mc-copy").addEventListener("click", async () => {
+      if (!mcCopied) return;
+      try {
+        await navigator.clipboard.writeText(mcCopied);
+      } catch {
+        const ta = document.createElement("textarea");
+        ta.value = mcCopied;
+        document.body.appendChild(ta);
+        ta.select();
+        document.execCommand("copy");
+        ta.remove();
+      }
+      toast("机器码已复制: " + mcCopied, "ok");
+    });
+    $("pro-cancel").addEventListener("click", () => proMask.classList.remove("show"));
+    $("pro-go").addEventListener("click", async () => {
+      const btn = $("pro-go"), msg = $("pro-msg");
+      btn.disabled = true;
+      msg.className = "";
+      msg.textContent = "正在离线验签...";
+      try {
+        await app.ActivatePro($("pro-key").value);
+        msg.className = "ok";
+        msg.textContent = "✓ 验签通过，Pro 已解锁";
+        toast("⚡ Pro 已解锁", "ok");
+        setTimeout(() => { proMask.classList.remove("show"); msg.textContent = ""; }, 900);
+      } catch (e) {
+        msg.className = "err";
+        msg.textContent = String(e);
+      } finally {
+        btn.disabled = false;
+      }
+    });
+    $("pro-key").addEventListener("keydown", (e) => { if (e.key === "Enter") $("pro-go").click(); });
+
+    // ===== 清除授权（测试用）：删 license.json，回 Free =====
+    $("clear-lic").addEventListener("click", async () => {
+      const st = await app.GetProState();
+      if (!st.pro) { toast("当前未激活，无需清除", "warn"); return; }
+      try {
+        await app.ClearLicense();
+        // renderState(false) 由 engine:state 事件统一刷新
+        toast("已清除授权，回到 Free 版", "ok");
+      } catch (e) {
+        toast(String(e), "err");
+      }
+    });
+  </script>
+</body>
+</html>

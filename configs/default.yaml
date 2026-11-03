@@ -1,0 +1,37 @@
+doh_endpoints:
+  - https://cloudflare-dns.com/dns-query
+  - https://dns.google/dns-query
+  - https://dns.alidns.com/dns-query
+domains:
+  - github.com
+  - assets-cdn.github.com
+  - github.global.ssl.fastly.net
+  - raw.githubusercontent.com
+  - objects.githubusercontent.com
+probe_timeout: 5s
+interval: 10m
+max_concurrent: 10
+max_probe_ips: 3        # 每个域名最多探测 DoH 前 3 个候选 IP（截断长尾，先到先决策）
+# 深度网页加速（Pro）：本地 TLS 分片代理
+web_proxy:
+  listen: 127.0.0.1:18080        # 本地代理监听地址（系统代理指向它）
+  split_window: 0                # 0=智能分片（首字节+SNI中点各切一刀）；>0=固定每片字节数
+  split_delay_ms: 10             # 分片之间的停顿毫秒数
+  dial_timeout_ms: 3000          # 单个候选 IP 的建连时限（3s 内连不上就换下一个）
+  compat_mode: false             # 兼容模式：true=不做 TLS 分片，纯 CONNECT 隧道（深信服 aTrust 等公司 VPN 场景）
+  split_hosts:                   # 只对这些域名后缀分片，其余纯隧道直通
+    - github.com
+    - githubusercontent.com
+    - githubassets.com
+    - github.io
+    - githubapp.com
+    - ghcr.io
+    - github.blog
+    - fastly.net
+
+  # 应急 IP 池：Hosts 优选 IP 与 DoH 全部拨不通时逐个试（最后保险，绝不优先于探测结果）
+  fallback_ips:
+    - suffix: github.com
+      ips: [140.82.112.3, 140.82.113.3, 20.27.177.113, 20.200.245.247]
+    - suffix: githubusercontent.com
+      ips: [185.199.108.133, 185.199.109.133, 185.199.110.133, 185.199.111.133]
