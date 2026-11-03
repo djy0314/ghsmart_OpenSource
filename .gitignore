@@ -6,6 +6,8 @@ ghsmart-keygen.exe~
 build-keygen.bat
 cmd/keygen/
 cmd/keygen-gui/
+tools/keygen-migrate/
+internal/keyring/
 
 # ===== 构建产物 / 本地产物 =====
 build/
