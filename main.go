@@ -8,6 +8,8 @@ import (
 	"embed"
 	"fmt"
 	"os"
+	"strconv"
+	"time"
 
 	"github.com/energye/systray"
 	"github.com/wailsapp/wails/v2"
@@ -42,16 +44,21 @@ func main() {
 		AssetServer: &assetserver.Options{
 			Assets: assets,
 		},
-		OnStartup: app.startup,
+		OnStartup: func(ctx context.Context) {
+			app.startup(ctx)
+			scheduleSelfQuit(app)
+		},
 		// DOM 就绪时前端的事件监听器已全部绑定完毕，此时重发一次授权状态，
 		// 保证「启动即显示 Pro/Free」，杜绝 OnStartup 阶段 emitState
 		// 早于 EventsOn 绑定而被吞掉的时序竞态。
 		OnDomReady: func(ctx context.Context) {
 			app.emitState()
 		},
-		// 点 X 不退出：隐藏到托盘；托盘「退出」才真正关闭
+		// 点 X 不退出：隐藏到托盘；托盘「退出」才真正关闭。
+		// 但退出流程已启动（quitting=true）时必须放行，否则 runtime.Quit
+		// 打不开关窗这一关，就变成「点了退出却退不掉」。
 		OnBeforeClose: func(ctx context.Context) bool {
-			if app.quitting.Load() {
+			if app.allowCloseOnX() {
 				return false // 允许真正关闭
 			}
 			wruntime.WindowHide(ctx)
@@ -72,6 +79,29 @@ func main() {
 		fmt.Fprintln(os.Stderr, "fatal:", err)
 		os.Exit(1)
 	}
+	// 任何退出路径（托盘退出 / 界面关闭 / 系统注销）走到这里都必须撤掉托盘图标，
+	// 否则 Windows 通知区域会残留一个点不动的幽灵图标。
+	systray.Quit()
+}
+
+// scheduleSelfQuit 是自动化验收钩子：环境变量 GHSMART_QUIT_SELFTEST=<毫秒> 时，
+// 启动后自动走一遍「托盘退出」流程（QuitApp），用来实证「点了退出进程真的会退」。
+//
+// 托盘菜单没法脚本点击，但退出链路（Shutdown → runtime.Quit → watchdog 强退）
+// 是同一份代码，所以这个钩子测的就是真实退出路径。普通用户不设该变量，行为不变。
+func scheduleSelfQuit(a *App) {
+	v := os.Getenv("GHSMART_QUIT_SELFTEST")
+	if v == "" {
+		return
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil || n <= 0 {
+		return
+	}
+	go func() {
+		time.Sleep(time.Duration(n) * time.Millisecond)
+		a.QuitApp()
+	}()
 }
 
 // onTrayReady 构建托盘图标与右键菜单。
@@ -96,7 +126,8 @@ func (a *App) onTrayReady() {
 		_ = a.RemoveHosts()
 	})
 	mQuit.Click(func() {
-		systray.Quit()
+		// 只交给 QuitApp：它内部会还原代理、撤托盘、关进程并带 watchdog 兜底。
+		// 绝不在这里先 systray.Quit()——那会让「退出没退掉」变成死局。
 		a.QuitApp()
 	})
 }

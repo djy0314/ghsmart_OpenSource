@@ -36,6 +36,7 @@ MOCK = r"""
 window.__calls = [];
 window.__errors = [];
 window.__state = { pro: __PRO__, autoHeal: false, deepAccel: false, deepListen: "", deepMode: "", deepCompat: false, deepCompatDefault: false };
+window.__blocked = __BLOCKED__;
 window.__wait = function (ms) { return new Promise(function (r) { setTimeout(r, ms); }); };
 function __log(msg) {
   window.__errors.push(msg);
@@ -48,16 +49,25 @@ window.runtime = { EventsOn: function () {} };
 window.go = { main: { App: {
   IsElevated: function () { return Promise.resolve(true); },
   GetAppliedEntries: function () { return Promise.resolve({ "github.com": "20.205.243.166" }); },
-  CheckDeepPrecondition: function () { window.__calls.push(["CheckDeepPrecondition"]); return { ok: true, reason: "", checked: 0 }; },
+  CheckDeepPrecondition: function () { window.__calls.push(["CheckDeepPrecondition"]);
+    if (window.__blocked) {
+      return { ok: false, live: true, checked: 1,
+        reason: "当前网络环境依然受限，请确保已彻底关闭公司 VPN 后重试。若仍不行，请仅使用「一键智能加速」。",
+        detail: ["候选来源·优选缓存: 20.205.243.166", "候选 20.205.243.166: TCP 连接超时（IP 不可达或被防火墙/VPN 拦截）"] };
+    }
+    return { ok: true, reason: "", checked: 0, live: true, detail: null }; },
   GetProState: function () { return Promise.resolve(window.__state); },
   SetAutoHeal: function (on) { window.__calls.push(["SetAutoHeal", on]);
     window.__state.autoHeal = on; return Promise.resolve(window.__state); },
-  SetDeepAccel: function (on, mode, compat) { window.__calls.push(["SetDeepAccel", on, mode, !!compat]);
+  SetDeepAccel: function (on, mode, compat, force) { window.__calls.push(["SetDeepAccel", on, mode, !!compat, !!force]);
     window.__state.deepCompat = on ? !!compat : window.__state.deepCompat;
     window.__state.deepAccel = on;
     window.__state.deepMode = on ? mode : "";
     window.__state.deepListen = on ? "127.0.0.1:18080" : "";
     return Promise.resolve(window.__state); },
+  RefreshDeepPrecondition: function () { window.__calls.push(["RefreshDeepPrecondition"]);
+    return window.__blocked ? { ok: false, reason: "当前网络环境依然受限，请确保已彻底关闭公司 VPN 后重试。若仍不行，请仅使用「一键智能加速」。",
+      detail: ["候选 20.205.243.166: TCP 连接超时（IP 不可达或被防火墙/VPN 拦截）"] } : { ok: true, live: true }; },
   GetMachineCode: function () { return Promise.resolve("EE76C20B7DB8B9C9"); },
   ActivatePro: function () { return Promise.resolve(); },
   ClearLicense: function () { return Promise.resolve(); },
@@ -89,6 +99,34 @@ function __overlap(a, b) {
 }
 async function __run() {
   var out = [];
+  // ===== 专项场景：预检失败弹窗（原因透明化 + 强制开启逃生通道）=====
+  if (window.__blocked) {
+    document.getElementById("deep-toggle").click();
+    await __wait(600);
+    out.push("blockedMask=" + document.getElementById("blocked-mask").className);
+    out.push("blockedReason=" + document.getElementById("blocked-reason").textContent.slice(0, 30));
+    out.push("blockedDetail=" + document.getElementById("blocked-detail").textContent.slice(0, 60));
+    // 重新检测（网络体检）：mock 仍返回失败，弹窗内容应被刷新且不报错
+    document.getElementById("blocked-refresh").click();
+    await __wait(600);
+    out.push("afterRefresh mask=" + document.getElementById("blocked-mask").className +
+             " callsHasRefresh=" + JSON.stringify(window.__calls.some(function (c) { return c[0] === "RefreshDeepPrecondition"; })));
+    // 强制开启 → 进模式窗且出现黄色警示条 → 确定 → 后端收到 force=true
+    document.getElementById("blocked-force").click();
+    await __wait(200);
+    out.push("modeMaskAfterForce=" + document.getElementById("mode-mask").className +
+             " forceNote=" + document.getElementById("mode-force-note").className);
+    document.getElementById("mode-ok").click();
+    await __wait(300);
+    var setCalls = window.__calls.filter(function (c) { return c[0] === "SetDeepAccel"; });
+    out.push("forceOn accel=" + window.__state.deepAccel +
+             " setCalls=" + JSON.stringify(setCalls) +
+             " statusTxt=" + JSON.stringify(document.getElementById("status-text").textContent));
+    out.push("errors=" + (window.__errors.length ? window.__errors.join("|") : "NONE"));
+    document.getElementById("__testlog").textContent = out.join("\n");
+    return;
+  }
+  // ===== 常规主流程场景 =====
   out.push("pro-toggle=" + __rect("pro-toggle"));
   out.push("deep-toggle=" + __rect("deep-toggle"));
   out.push("restore-btn=" + __rect("restore-btn"));
@@ -152,16 +190,20 @@ setTimeout(__run, 350);
 """
 
 
-def build_page(pro):
+def build_page(pro, blocked=False):
     with open(SRC, "r", encoding="utf-8") as f:
         html = f.read()
     mock = MOCK.replace("__PRO__", "true" if pro else "false")
+    mock = mock.replace("__BLOCKED__", "true" if blocked else "false")
     marker = "  <script>\n    // ===== 基础引用 ====="
     if marker not in html:
         raise SystemExit("找不到主脚本插入点，index.html 结构变了？")
     html = html.replace(marker, mock + marker, 1)
     html = html.replace("</body>", DRIVER + "</body>", 1)
-    path = os.path.join(OUT_DIR, "ui_pro.html" if pro else "ui_free.html")
+    name = "ui_pro" if pro else "ui_free"
+    if blocked:
+        name = "ui_blocked"
+    path = os.path.join(OUT_DIR, name + ".html")
     with open(path, "w", encoding="utf-8") as f:
         f.write(html)
     return path
@@ -204,6 +246,11 @@ def main():
         png = os.path.join(OUT_DIR, "ui_pro.png" if pro else "ui_free.png")
         shoot(browser, page, png)
         print("OK ->", png)
+    # 专项：预检失败弹窗（原因透明化 + 重新检测 + 强制开启）
+    page = build_page(True, blocked=True)
+    png = os.path.join(OUT_DIR, "ui_blocked.png")
+    shoot(browser, page, png)
+    print("OK ->", png)
     return 0
 
 

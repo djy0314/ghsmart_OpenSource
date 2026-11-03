@@ -188,6 +188,20 @@ func SaveProbeReport(domains map[string][]ProbeRecord) error {
 	return os.Rename(tmp, p)
 }
 
+// ClearProbeReport 删除历史探测报告（文件不存在视为成功）。
+// 用途：深度加速预检已改为实时微测，旧报告一律作废；
+// 一键智能加速开始时也强制清空，避免旧结论干扰后续判断。
+func ClearProbeReport() error {
+	p, err := ProbePath()
+	if err != nil {
+		return err
+	}
+	if err := os.Remove(p); err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	return nil
+}
+
 // LoadProbeReport 读取探测报告；文件缺失返回空 map、零时间与 nil 错误。
 func LoadProbeReport() (map[string][]ProbeRecord, time.Time, error) {
 	domains := map[string][]ProbeRecord{}

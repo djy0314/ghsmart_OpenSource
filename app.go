@@ -4,6 +4,7 @@ package main
 
 import (
 	"context"
+	"crypto/tls"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -15,6 +16,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/energye/systray"
 	"github.com/wailsapp/wails/v2/pkg/runtime"
 	syswin "golang.org/x/sys/windows"
 
@@ -164,6 +166,12 @@ func (g guiReporter) Warn(msg string) {
 // 缓存秒应用对免费版无条件开放（产品基础体验，绝不与 Pro 绑定）。
 // 过程通过 engine:cache / engine:primary / engine:domain / engine:applied 事件推送前端。
 func (a *App) StartApply() error {
+	// 清空上一轮探测报告：深度加速预检已改为实时微测，旧报告只会误导人；
+	// 本轮探测结束后引擎会写入新的报告（覆盖式）。放在最前面，
+	// 保证用户一点击就作废旧结论（哪怕后面因为忙/未就绪提前返回）。
+	if err := cache.ClearProbeReport(); err != nil {
+		a.logf("清理历史探测报告失败（不影响加速）: %v", err)
+	}
 	if a.ctx == nil {
 		return errors.New("应用尚未就绪")
 	}
@@ -408,11 +416,60 @@ func (a *App) IsElevated() bool {
 	return syswin.GetCurrentProcessToken().IsElevated()
 }
 
-// QuitApp 托盘「退出」专用：先还原系统代理，再真正关闭进程。
+// allowCloseOnX 回答「现在点窗口 ✕ 该不该真的关闭」。
+//
+// 平时返回 false：✕ 只是隐藏到托盘（托盘工具的正常行为）。
+// 一旦退出流程启动（托盘点了「退出」），必须返回 true——否则 runtime.Quit
+// 会卡在 OnBeforeClose 这一关，窗口永远关不掉，用户只能杀进程。
+func (a *App) allowCloseOnX() bool {
+	return a.quitting.Load()
+}
+
+// quitWatchdogDelay 是「请求退出」到「强制结束进程」的等待时间。
+// 正常退出远快于此；留够时间让 Wails 先走完 OnBeforeClose / OnShutdown。
+// 声明成变量是为了测试能缩短它（测试进程不能被 os.Exit 打死）。
+var quitWatchdogDelay = 2 * time.Second
+
+// forceQuit 是退出兜底的执行体：先撤托盘（避免幽灵图标），再强制结束进程。
+// 声明成变量同样是为了测试可替换。
+var forceQuit = func() {
+	systray.Quit()
+	time.Sleep(200 * time.Millisecond)
+	os.Exit(0)
+}
+
+// QuitApp 是唯一的「退出程序」入口（托盘菜单、界面关闭都走这里）。
+//
+// 顺序很关键（血泪）：必须先把 quitting 置位、还原系统代理，**最后**才撤托盘图标。
+// 旧实现先 systray.Quit() 再 runtime.Quit()，一旦 Wails 没能立刻结束进程，
+// 就进入「托盘消息循环已停、图标点不动、进程还活着」的死局——用户只能去
+// 任务管理器杀进程。
+//
+// 另外加一道 watchdog 兜底：托盘程序必须保证「点了退出就一定退」，
+// 正常退出时进程会先结束、watchdog 自然消失；只有 runtime.Quit 失效时它才生效。
 func (a *App) QuitApp() {
-	a.Shutdown()
-	a.quitting.Store(true)
-	runtime.Quit(a.ctx)
+	if !a.quitting.CompareAndSwap(false, true) {
+		return // 已经在退出流程中，重复点击直接忽略
+	}
+	a.logf("用户请求退出：还原系统代理并关闭进程")
+	a.Shutdown() // 幂等：还原代理、停自愈、关日志
+
+	if a.ctx != nil {
+		runtime.Quit(a.ctx)
+	}
+
+	go func() {
+		// 正常情况进程会在数百毫秒内结束，走不到这里。
+		// 走到这里说明 Wails 没能关掉窗口（隐藏态 / 消息循环卡住），
+		// 必须强退：否则托盘已撤、进程常驻，用户再也关不掉了。
+		time.Sleep(quitWatchdogDelay)
+		// 强退前再精准还原一次系统代理（毫秒级、幂等）：万一同步清场被
+		// 卡住没跑完，进程一走代理还指着死端口就等于让用户断网。
+		if _, err := sysproxy.Restore(a.targetAddr()); err != nil {
+			a.logf("退出兜底：还原系统代理失败: %v", err)
+		}
+		forceQuit()
+	}()
 }
 
 // Shutdown 退出前的清场：还原系统代理（最关键，否则用户会断网）并停掉自愈循环。
@@ -661,19 +718,26 @@ func normalizeDeepMode(mode string) string {
 //	on=true, mode=manual → 只启动本地代理端口，绝对不碰注册表
 //	on=false             → 精准还原系统代理后关闭端口
 //	compat=true          → 兼容模式：不做 TLS 分片，纯 CONNECT 隧道（公司 VPN 场景）
+//	force=true           → 跳过实时微测预检（用户点「仍然强制开启」的逃生通道）
 //
 // 返回操作后的真实状态，前端必须用返回值渲染。
-func (a *App) SetDeepAccel(on bool, mode string, compat bool) (map[string]any, error) {
+func (a *App) SetDeepAccel(on bool, mode string, compat bool, force bool) (map[string]any, error) {
 	if !a.pro.Load() {
 		return a.proState(), errors.New("深度网页加速是 Pro 功能，请先解锁")
 	}
 	mode = normalizeDeepMode(mode)
 	if on {
-		// 预检闸（后端为准，前端拦截只是体验优化）：上一轮探测显示
-		// 主域名全部候选 IP 不可达 → 直接拒绝开启，引导用 Hosts 模式
-		if ok, reason, checked := a.deepPrecheck(a.primaryDomain(), time.Now()); !ok {
-			a.logf("深度加速被预检拦截（主域名 %d 个候选全部不可达）", checked)
-			return a.proState(), errors.New(reason)
+		// 预检闸（后端为准，前端拦截只是体验优化）：现场做 2 秒实时微测，
+		// 只要此刻能连上 github.com 就放行——绝不拿旧报告拦人。
+		// force=true 是用户点了「仍然强制开启」的逃生通道：跳过微测，
+		// 但照样记录在案（日志可查、后果自负）。
+		if !force {
+			if ok, reason, checked, _ := a.deepPrecheckLive(a.primaryDomain()); !ok {
+				a.logf("深度加速被预检拦截（实时微测 %d 个候选全部不可达）", checked)
+				return a.proState(), errors.New(reason)
+			}
+		} else {
+			a.logf("深度加速被用户强制开启（跳过实时微测预检）")
 		}
 		if err := a.startDeep(a.loadCfg(), mode, compat); err != nil {
 			return a.proState(), err
@@ -885,46 +949,198 @@ func (a *App) autoFallbackDeep(reason string) {
 	})
 }
 
-// deepPrecheckFreshWindow 是预检证据的有效期：探测报告必须足够新才用于拦截。
-// （每次启动/点击加速都会刷新报告，正常使用中报告总是几分钟内的）
-const deepPrecheckFreshWindow = 6 * time.Hour
+// classifyNetErr 把底层探测错误翻译成用户能看懂的失败原因（透明化）。
+func classifyNetErr(errStr string) string {
+	s := strings.ToLower(errStr)
+	switch {
+	case strings.Contains(s, "no such host") || strings.Contains(s, "lookup"):
+		return "DNS 解析失败"
+	case strings.Contains(s, "tcp 失败") && strings.Contains(s, "i/o timeout"):
+		return "TCP 连接超时（IP 不可达或被防火墙/VPN 拦截）"
+	case strings.Contains(s, "tls 失败") && (strings.Contains(s, "reset") || strings.Contains(s, "forcibly closed")):
+		return "TLS 握手被重置（典型的 VPN/防火墙代答拦截）"
+	case strings.Contains(s, "tls 失败") && strings.Contains(s, "i/o timeout"):
+		return "TLS 握手超时（连接被静默丢弃）"
+	case strings.Contains(s, "certificate"):
+		return "证书校验失败（连上的不是真 GitHub，DNS 被污染）"
+	default:
+		return errStr
+	}
+}
 
-// deepPrecheck 判断「深度加速」是否应被预检拦截：
-// 上一轮探测里主域名（github.com）的全部候选 IP 均不可达（超时/被拦）且证据新鲜 → 拦。
-// 没有报告 / 报告过期 / 有任一 IP 可用 → 放行（绝不因缺证据误拦）。
-func (a *App) deepPrecheck(domain string, now time.Time) (ok bool, reason string, checked int) {
-	if domain == "" {
-		return true, "", 0
+// deepCheckResult 是实时微测的完整结果：是否可用 + 逐条诊断明细。
+type deepCheckResult struct {
+	OK      bool
+	Checked int      // 实际尝试的候选 IP 数
+	Detail  []string // 给用户看的失败原因明细（成功时可能为空）
+}
+
+// deepLiveCheckTimeout 是「深度加速」实时预检微测的总预算。
+// 号主定稿：2 秒即可——够一次真实 TCP+TLS 握手，又不至于让用户干等。
+const deepLiveCheckTimeout = 2 * time.Second
+
+// deepRestrictedMsg 是实时微测全部失败时的提示文案（号主定稿，勿改字）。
+const deepRestrictedMsg = "当前网络环境依然受限，请确保已彻底关闭公司 VPN 后重试。若仍不行，请仅使用「一键智能加速」。"
+
+// deepProbeFn 是实时连通性微测的实现（测试可替换），默认走 probe.ProbeIPs
+// ——真实的 TCP 连接 + SNI 严格校验证书 TLS 握手 + HTTP 应答。
+var deepProbeFn = probe.ProbeIPs
+
+// directTLSCheck 是最小保底微测：系统 DNS 直连 domain:443，做一次
+// 严格校验证书的 TLS 握手。用于「一个候选 IP 都拿不到」时仍能判定网络是否恢复。
+var directTLSCheck = func(domain string, timeout time.Duration) (bool, error) {
+	nc, err := (&net.Dialer{Timeout: timeout}).Dial("tcp", net.JoinHostPort(domain, "443"))
+	if err != nil {
+		return false, err
 	}
-	report, savedAt, err := cache.LoadProbeReport()
-	if err != nil || len(report) == 0 {
-		return true, "", 0
+	defer nc.Close()
+	conn := tls.Client(nc, &tls.Config{ServerName: domain, MinVersion: tls.VersionTLS12})
+	_ = nc.SetDeadline(time.Now().Add(timeout))
+	if err := conn.Handshake(); err != nil {
+		return false, err
 	}
-	recs := report[domain]
-	if len(recs) == 0 {
-		return true, "", 0
+	_ = conn.Close()
+	return true, nil
+}
+
+// dohResolveCap 是预检里 DoH 现解析的时间上限：只为补充候选 IP，
+// 拿不到就直连兜底，绝不能把整个 2 秒预算耗在 DNS 上（国内 DoH 常被墙）。
+const dohResolveCap = 700 * time.Millisecond
+
+// deepCandidatesFn 是候选收集的可注入入口（测试用来造「候选为空」场景，
+// 验证拿不到任何 IP 时会退回直连 TLS 兜底，而不是误判成网络受限）。
+var deepCandidatesFn = func(a *App, ctx context.Context, cfg *config.Config, domain string, dohTimeout time.Duration, detail *[]string) []string {
+	return a.deepCandidates(ctx, cfg, domain, dohTimeout, detail)
+}
+
+// deepCandidates 收集实时微测的候选 IP（最多 4 个，按「最可能通」排序）：
+// Hosts 现有记录 → 优选缓存 → DoH 解析（受 dohTimeout 限制）。
+// detail 记录候选收集过程，微测失败时原样展示给用户。
+func (a *App) deepCandidates(ctx context.Context, cfg *config.Config, domain string, dohTimeout time.Duration, detail *[]string) []string {
+	seen := make(map[string]bool, 4)
+	out := make([]string, 0, 4)
+	add := func(ip string) {
+		if ip == "" || len(out) >= 4 || seen[ip] || net.ParseIP(ip) == nil {
+			return
+		}
+		seen[ip] = true
+		out = append(out, ip)
 	}
-	if savedAt.IsZero() || now.Sub(savedAt) > deepPrecheckFreshWindow {
-		return true, "", len(recs) // 证据过期：不拦，让用户自己试
-	}
-	for _, r := range recs {
-		if r.OK {
-			return true, "", len(recs)
+	// 1. Hosts 里正在生效的记录（用户点过一键加速才会写）
+	if entries, err := executor.ReadHostsBlock(); err == nil {
+		if ip := entries[domain]; ip != "" {
+			*detail = append(*detail, "候选来源·Hosts 现有记录: "+ip)
+			add(ip)
 		}
 	}
-	return false, "当前网络环境受限（可能开启了 VPN），无法使用深度加速。请仅使用「一键智能加速」。", len(recs)
+	// 2. 优选缓存（上次探测成功的结果）
+	if m, _, err := cache.Load(); err == nil {
+		if ip := m[domain]; ip != "" {
+			*detail = append(*detail, "候选来源·优选缓存: "+ip)
+			add(ip)
+		}
+	}
+	// 3. DoH 现解析（拿不到新 IP 也不影响前两步）
+	if len(out) < 4 && len(cfg.DoHEndpoints) > 0 {
+		dctx, cancel := context.WithTimeout(ctx, dohTimeout)
+		defer cancel()
+		ips, err := doh.ResolveWith(dctx, domain, cfg.DoHEndpoints)
+		if err != nil {
+			*detail = append(*detail, "候选来源·DoH 解析失败: "+classifyNetErr(err.Error()))
+		} else if got := doh.DedupIPStrings(ips); len(got) == 0 {
+			*detail = append(*detail, "候选来源·DoH 解析成功但无应答记录")
+		} else {
+			for _, ip := range got {
+				add(ip)
+			}
+		}
+	}
+	return out
+}
+
+// deepLiveCheck 立刻做一次针对主域名的真实 TCP/TLS 连通性微测。
+// 任一候选探测通过即放行；候选全空时退回系统 DNS 直连 TLS 握手。
+// 总耗时受 deepLiveCheckTimeout 约束（DoH 现解析最多占 dohResolveCap，
+// 剩余时间全部留给真正的连通性探测）。Detail 带逐条失败原因（透明化）。
+func (a *App) deepLiveCheck(cfg *config.Config, domain string) deepCheckResult {
+	if domain == "" {
+		return deepCheckResult{OK: true} // 没配域名就没有可拦的依据
+	}
+	deadline := time.Now().Add(deepLiveCheckTimeout)
+	ctx, cancel := context.WithDeadline(context.Background(), deadline)
+	defer cancel()
+
+	detail := make([]string, 0, 8)
+	ips := deepCandidatesFn(a, ctx, cfg, domain, dohResolveCap, &detail)
+	remain := time.Until(deadline)
+	if remain < 300*time.Millisecond {
+		remain = 300 * time.Millisecond // 保底握手时间；总耗时最多约 2.3 秒
+	}
+	if len(ips) == 0 {
+		ok, err := directTLSCheck(domain, remain)
+		if ok {
+			return deepCheckResult{OK: true}
+		}
+		detail = append(detail, "系统 DNS 直连 "+domain+":443 失败: "+classifyNetErr(err.Error()))
+		return deepCheckResult{Checked: 0, Detail: detail}
+	}
+	pctx, pcancel := context.WithTimeout(context.Background(), remain)
+	defer pcancel()
+	for _, r := range deepProbeFn(pctx, ips, domain, remain) {
+		if r.OK {
+			return deepCheckResult{OK: true, Checked: len(ips)}
+		}
+		if r.Err != "" {
+			detail = append(detail, "候选 "+r.IP+": "+classifyNetErr(r.Err))
+		}
+	}
+	return deepCheckResult{Checked: len(ips), Detail: detail}
+}
+
+// deepPrecheckLive 是深度加速的预检闸，只认「此刻的真实连通性」。
+//
+// 历史教训：旧实现读 lastprobe.json（上一轮探测报告）判定，用户在 VPN 下
+// 失败过一次后，即使关掉 VPN、网络已恢复，6 小时内仍会被旧报告拦截。
+// 现在改为实时微测：通就放行（并清掉旧失败报告），确实不通才拦截——
+// 拦截时附上逐条失败原因（detail），UI 提供「仍然强制开启」逃生通道。
+func (a *App) deepPrecheckLive(domain string) (ok bool, reason string, checked int, detail []string) {
+	cfg := a.loadCfg()
+	res := a.deepLiveCheck(cfg, domain)
+	if res.OK {
+		// 网络已恢复：旧的失败报告立刻作废，避免下次再拿它当依据
+		if err := cache.ClearProbeReport(); err != nil {
+			a.logf("清理历史探测报告失败（不影响放行）: %v", err)
+		}
+		return true, "", res.Checked, nil
+	}
+	return false, deepRestrictedMsg, res.Checked, res.Detail
 }
 
 // CheckDeepPrecondition 供前端在打开「深度加速」弹窗前调用：
-// 预检拦截时返回 ok=false 与给用户看的 reason。
+// 每次都现场发起 2 秒实时微测，拦截时返回 reason + 逐条诊断明细（detail）。
 func (a *App) CheckDeepPrecondition() map[string]any {
-	ok, reason, checked := a.deepPrecheck(a.primaryDomain(), time.Now())
+	ok, reason, checked, detail := a.deepPrecheckLive(a.primaryDomain())
+	a.logf("深度加速预检（实时微测）: ok=%v 候选=%d", ok, checked)
 	return map[string]any{
 		"ok":      ok,
 		"reason":  reason,
 		"domain":  a.primaryDomain(),
 		"checked": checked,
+		"live":    true,
+		"detail":  detail,
 	}
+}
+
+// RefreshDeepPrecondition 是「网络体检·重新检测」：强制清空探测报告与
+// 代理侧 IP 缓存（DoH 每次都是现查、无本地缓存），然后立刻重跑实时微测，
+// 保证用户点刷新时绝不被任何陈旧状态卡死。
+func (a *App) RefreshDeepPrecondition() map[string]any {
+	a.invalidateAllHostIP()
+	if err := cache.ClearProbeReport(); err != nil {
+		a.logf("网络体检清理探测报告失败: %v", err)
+	}
+	a.logf("网络体检: 已清空探测报告与 IP 缓存，重新实时微测")
+	return a.CheckDeepPrecondition()
 }
 
 // primaryDomain 返回配置域名列表的主域名（github.com）；列表为空返回空串。

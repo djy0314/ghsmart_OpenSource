@@ -115,7 +115,7 @@ func TestDeepAccelGating(t *testing.T) {
 	t.Setenv("GHSMART_SYSPROXY_FILE", filepath.Join(t.TempDir(), "sysproxy.bak.json"))
 
 	a := NewApp()
-	if _, err := a.SetDeepAccel(true, DeepModeAuto, false); err == nil {
+	if _, err := a.SetDeepAccel(true, DeepModeAuto, false, false); err == nil {
 		t.Fatal("Free 版应拒绝开启深度加速")
 	}
 	if a.GetProState()["deepAccel"].(bool) {
@@ -127,7 +127,7 @@ func TestDeepAccelGating(t *testing.T) {
 
 	// 未开启状态下关闭：安全空操作
 	a.pro.Store(true)
-	st, err := a.SetDeepAccel(false, "", false)
+	st, err := a.SetDeepAccel(false, "", false, false)
 	if err != nil {
 		t.Fatalf("关闭失败: %v", err)
 	}

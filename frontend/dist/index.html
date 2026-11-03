@@ -129,6 +129,39 @@
     #mode-mask .go { background: var(--accent); color: #06283d; font-weight: 600; }
     #mode-mask .cancel { background: var(--line); color: var(--txt); }
     #mode-mask button:disabled { opacity: .5; cursor: not-allowed; }
+    #mode-force-note {
+      display: none; font-size: 11.5px; color: var(--warn);
+      background: rgba(251,191,36,.08); border: 1px dashed var(--warn);
+      border-radius: 8px; padding: 8px 10px; margin-bottom: 10px; line-height: 1.6;
+    }
+    #mode-force-note.show { display: block; }
+
+    /* 预检失败弹窗：失败原因透明化 + 重新检测（网络体检）+ 强制开启逃生通道 */
+    #blocked-mask {
+      position: fixed; inset: 0; background: rgba(0,0,0,.6);
+      display: flex; align-items: center; justify-content: center; z-index: 56;
+      opacity: 0; visibility: hidden; transition: opacity .15s, visibility .15s;
+    }
+    #blocked-mask.show { opacity: 1; visibility: visible; }
+    #blocked-mask .card {
+      width: 470px; background: var(--panel); border: 1px solid var(--line);
+      border-radius: 12px; padding: 22px;
+    }
+    #blocked-mask h3 { font-size: 15px; margin-bottom: 10px; color: var(--warn); }
+    #blocked-reason { font-size: 13px; line-height: 1.7; margin-bottom: 10px; }
+    #blocked-detail {
+      font-family: Consolas, "Courier New", monospace; font-size: 11.5px; color: var(--dim);
+      background: var(--panel2); border: 1px solid var(--line); border-radius: 8px;
+      padding: 10px 12px; max-height: 150px; overflow-y: auto; line-height: 1.7;
+      margin-bottom: 10px; white-space: pre-wrap; word-break: break-all;
+    }
+    #blocked-mask .hint { font-size: 11.5px; color: var(--dim); margin-bottom: 12px; line-height: 1.6; }
+    #blocked-mask .btns { display: flex; gap: 10px; }
+    #blocked-mask button { flex: 1; padding: 9px; border-radius: 8px; font-size: 12.5px; cursor: pointer; border: none; }
+    #blocked-mask .cancel { background: var(--line); color: var(--txt); }
+    #blocked-mask .refresh { background: transparent; border: 1px solid var(--accent); color: var(--accent); }
+    #blocked-mask .force { background: var(--warn); color: #442c00; font-weight: 600; }
+    #blocked-mask button:disabled { opacity: .5; cursor: not-allowed; }
 
     /* 分组标题：上面必选二选一，下面可选附加开关，防呆防误解 */
     .grp-title {
@@ -225,7 +258,7 @@
   <header>
     <svg class="logo" viewBox="0 0 512 512"><rect x="16" y="16" width="480" height="480" rx="96" fill="#0f172a" stroke="#38bdf8" stroke-width="12"/><polygon points="300,60 170,270 250,270 200,452 360,230 270,230 330,60" fill="#34d399"/></svg>
     <h1>ghsmart</h1>
-    <span class="ver" id="ver-text">Free v1.0.0 · 纯本地加速</span>
+    <span class="ver" id="ver-text">Free v1.0.1 · 纯本地加速</span>
     <button id="clear-lic" type="button" title="删除本地授权文件并回到 Free 状态（测试用）">清除授权</button>
   </header>
 
@@ -307,9 +340,25 @@
           <span class="d">如果您在公司内网使用深信服等 VPN，请勾选此项。它会关闭高级分片特性，防止被 VPN 拦截断网。</span>
         </span>
       </label>
+      <div id="mode-force-note">⚠️ 已选择忽略网络受限警告（强制开启）。若加速后网页仍打不开，请关闭深度加速并改用「一键智能加速」。</div>
       <div class="btns">
         <button class="cancel" id="mode-cancel">取消</button>
         <button class="go" id="mode-ok">确定开启</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- 预检失败弹窗：原因透明化 + 重新检测（网络体检）+ 强制开启逃生通道 -->
+  <div id="blocked-mask">
+    <div class="card">
+      <h3>⚠️ 网络受限提醒</h3>
+      <div id="blocked-reason"></div>
+      <div id="blocked-detail"></div>
+      <div class="hint">如果刚才开着 VPN，请确认其已彻底退出（部分 VPN 的底层服务仍会劫持路由），然后点「重新检测」再试。</div>
+      <div class="btns">
+        <button class="cancel" id="blocked-cancel">取消</button>
+        <button class="refresh" id="blocked-refresh">🔄 重新检测</button>
+        <button class="force" id="blocked-force">⚠️ 仍然强制开启</button>
       </div>
     </div>
   </div>
@@ -422,7 +471,7 @@
         } else {
           deep.title = "Pro 功能：本地 TLS 分片代理，绕过 SNI 阻断（无需安装任何证书）。公司 VPN（深信服 aTrust 等）环境请勾选兼容模式，或仅使用一键智能加速";
         }
-        if (verTxt) verTxt.textContent = "Pro v1.0.0 · 已授权";
+        if (verTxt) verTxt.textContent = "Pro v1.0.1 · 已授权";
       } else {
         box.classList.remove("unlocked", "healing");
         deep.classList.remove("unlocked", "on");
@@ -432,7 +481,7 @@
         if (deepLock) deepLock.textContent = "🔒";
         if (healTxt) healTxt.textContent = "";
         if (deepTxt) deepTxt.textContent = "";
-        if (verTxt) verTxt.textContent = "Free v1.0.0 · 纯本地加速";
+        if (verTxt) verTxt.textContent = "Free v1.0.1 · 纯本地加速";
       }
     }
 
@@ -636,6 +685,9 @@
     const modeMask = $("mode-mask");
     let deepBusy = false;
     let pendingMode = "auto";
+    let pendingForce = false;          // 「仍然强制开启」逃生通道
+    let deepLastMode = "auto";         // 记录最近一次弹窗的默认模式（重新检测后复用）
+    let deepCompatDefault = false;
 
     function syncModeUI() {
       $("mode-auto").classList.toggle("sel", pendingMode === "auto");
@@ -650,35 +702,92 @@
       const cc = $("compat-check");
       if (cc) cc.checked = !!compatDefault;
       syncModeUI();
+      const fn = $("mode-force-note");
+      if (fn) fn.classList.toggle("show", pendingForce);
       modeMask.classList.add("show");
     }
 
     $("mode-auto").addEventListener("click", () => { pendingMode = "auto"; syncModeUI(); });
     $("mode-manual").addEventListener("click", () => { pendingMode = "manual"; syncModeUI(); });
-    $("mode-cancel").addEventListener("click", () => modeMask.classList.remove("show"));
+    $("mode-cancel").addEventListener("click", () => { modeMask.classList.remove("show"); pendingForce = false; });
+
+    // 预检失败弹窗：展示逐条失败原因；「重新检测」= 网络体检（清空探测报告与
+    // IP 缓存后现场重测）；「仍然强制开启」= 逃生通道，跳过预检直接进模式选择。
+    function openBlockedModal(reason, detail) {
+      $("blocked-reason").textContent = reason || "当前网络环境受限";
+      const lines = (Array.isArray(detail) && detail.length)
+        ? detail
+        : ["（未拿到具体失败原因：所有候选可能都在超时中）"];
+      $("blocked-detail").textContent = lines.join("\n");
+      $("blocked-detail").scrollTop = 0;
+      $("blocked-mask").classList.add("show");
+    }
+
+    $("blocked-cancel").addEventListener("click", () => {
+      $("blocked-mask").classList.remove("show");
+      pendingForce = false;
+    });
+
+    $("blocked-refresh").addEventListener("click", async () => {
+      const btn = $("blocked-refresh");
+      btn.disabled = true;
+      btn.textContent = "检测中...";
+      setStatus("正在重新检测网络（网络体检）...", "busy");
+      try {
+        const pc = await app.RefreshDeepPrecondition();
+        if (pc && pc.ok !== false) {
+          $("blocked-mask").classList.remove("show");
+          setStatus("", "");
+          toast("✅ 网络体检通过，可以开启深度加速", "ok");
+          openModeModal(deepLastMode, deepCompatDefault);
+        } else {
+          openBlockedModal((pc && pc.reason) || "当前网络环境依然受限", pc && pc.detail);
+          setStatus("网络体检仍未通过", "warn");
+        }
+      } catch (e) {
+        toast(String(e), "err");
+        setStatus("网络体检失败", "err");
+      } finally {
+        btn.disabled = false;
+        btn.textContent = "🔄 重新检测";
+      }
+    });
+
+    $("blocked-force").addEventListener("click", () => {
+      pendingForce = true;
+      $("blocked-mask").classList.remove("show");
+      openModeModal(deepLastMode, deepCompatDefault);
+    });
 
     $("mode-ok").addEventListener("click", async () => {
       if (deepBusy) return;
       const mode = pendingMode;
       const compat = !!( $("compat-check") && $("compat-check").checked );
+      const force = pendingForce;
       deepBusy = true;
       $("mode-ok").disabled = true;
       setStatus(mode === "auto" ? "正在接管系统代理..." : "正在启动本地代理...", "busy");
       try {
-        const st2 = await app.SetDeepAccel(true, mode, compat);
+        const st2 = await app.SetDeepAccel(true, mode, compat, force);
         modeMask.classList.remove("show");
         renderState(st2);
         // bypass 清理是 ERR_CONNECTION_CLOSED 的根因修复，清理了多少必须让用户看见
         const removed = (st2 && st2.bypassRemoved) ? st2.bypassRemoved.length : 0;
-        setStatus("深度加速已开启" + (compat ? "（兼容模式）" : "") + (removed ? "（已清理 " + removed + " 条代理例外）" : ""), "ok");
-        if (compat) {
-          toast("🌐 已开启（兼容模式：不分片，纯隧道，适配公司 VPN）" + (removed ? "，并清理 " + removed + " 条代理例外" : ""), "ok");
-        } else if (mode === "auto") {
-          toast(removed
-            ? "🌐 已接管系统代理，并清理 " + removed + " 条 GitHub 代理例外"
-            : "🌐 已开启并接管系统代理（代理例外列表已干净）", "ok");
+        if (force) {
+          // 逃生通道：黄色警示，明示是用户自行承担的强制开启
+          setStatus("深度加速已强制开启，请自行确认网络环境", "warn");
+          toast("⚠️ 深度加速已强制开启，请自行确认网络环境", "warn");
         } else {
-          toast("🌐 已开启本地代理（手动模式，未改系统代理）", "ok");
+          setStatus("深度加速已开启" + (compat ? "（兼容模式）" : "") + (removed ? "（已清理 " + removed + " 条代理例外）" : ""), "ok");
+          if (compat) {
+            toast("🌐 已开启（兼容模式：不分片，纯隧道，适配公司 VPN）" + (removed ? "，并清理 " + removed + " 条代理例外" : ""), "ok");
+          } else if (mode === "auto") {
+            toast(removed
+              ? "🌐 已接管系统代理，并清理 " + removed + " 条 GitHub 代理例外"
+              : "🌐 已开启并接管系统代理（代理例外列表已干净）", "ok");
+          } else {
+            toast("🌐 已开启本地代理（手动模式，未改系统代理）", "ok");
+          }
         }
       } catch (e) {
         toast(String(e), "err");
@@ -687,6 +796,7 @@
         try { renderState(await app.GetProState()); } catch (_) {}
       } finally {
         deepBusy = false;
+        pendingForce = false;
         $("mode-ok").disabled = false;
       }
     });
@@ -702,22 +812,26 @@
         if (st.deepAccel) {
           deepBusy = true;
           setStatus("正在关闭并还原系统代理...", "busy");
-          const st2 = await app.SetDeepAccel(false, st.deepMode || "auto", !!st.deepCompat);
+          const st2 = await app.SetDeepAccel(false, st.deepMode || "auto", !!st.deepCompat, false);
           renderState(st2);
           setStatus("深度加速已关闭", "ok");
           toast("深度网页加速已关闭，系统代理已还原", "ok");
           return;
         }
-        // 开启前预检：上一轮探测显示主域名全部 IP 不可达 → 直接拦截，不弹模式窗
+        deepLastMode = st.deepMode || "auto";
+        deepCompatDefault = !!st.deepCompatDefault;
+        // 开启前预检：现场 2 秒实时微测（不看历史报告）——只要此刻网络能通就放行
         try {
+          setStatus("正在校验当前网络连通性（约 2 秒）...", "busy");
           const pc = await app.CheckDeepPrecondition();
           if (pc && pc.ok === false) {
-            setStatus("深度加速被预检拦截", "warn");
-            toast("🚫 " + pc.reason, "warn");
+            setStatus("当前网络环境受限", "warn");
+            openBlockedModal(pc.reason, pc.detail); // 原因透明化 + 逃生通道都在弹窗里
             return;
           }
-        } catch (_) { /* 预检失败不挡路，后端 SetDeepAccel 还有同款闸 */ }
-        openModeModal(st.deepMode, st.deepCompatDefault); // 兼容默认取配置文件
+          setStatus("", "");
+        } catch (_) { /* 预检异常不挡路，后端 SetDeepAccel 还有同款实时闸 */ }
+        openModeModal(deepLastMode, deepCompatDefault);
       } catch (e) {
         toast(String(e), "err");
         setStatus("深度加速切换失败", "err");

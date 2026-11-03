@@ -1,5 +1,6 @@
 # ===== 红线：绝不入库 =====
 keygen_private.pem
+keygen_private.bin
 keygen.exe
 ghsmart-keygen.exe
 ghsmart-keygen.exe~
@@ -13,7 +14,7 @@ internal/keyring/
 build/
 .uitest/
 ghsmart_release/
-ghsmart_v1.0.0.zip
+ghsmart_v*.zip
 ghsmart.exe
 ghsmart-keygen*
 *.log

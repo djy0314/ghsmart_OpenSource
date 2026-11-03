@@ -17,11 +17,13 @@ export function IsElevated():Promise<boolean>;
 
 export function QuitApp():Promise<void>;
 
+export function RefreshDeepPrecondition():Promise<Record<string, any>>;
+
 export function RemoveHosts():Promise<void>;
 
 export function SetAutoHeal(arg1:boolean):Promise<Record<string, any>>;
 
-export function SetDeepAccel(arg1:boolean,arg2:string,arg3:boolean):Promise<Record<string, any>>;
+export function SetDeepAccel(arg1:boolean,arg2:string,arg3:boolean,arg4:boolean):Promise<Record<string, any>>;
 
 export function Shutdown():Promise<void>;
 
