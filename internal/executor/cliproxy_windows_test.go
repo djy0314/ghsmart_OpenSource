@@ -5,6 +5,7 @@
 package executor
 
 import (
+	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -19,9 +20,11 @@ func (m memEnv) Get(name string) (string, bool) {
 func (m memEnv) Set(name, value string) error { m[name] = value; return nil }
 func (m memEnv) Del(name string) error        { delete(m, name); return nil }
 
-// useMemEnv 把环境变量与广播都换成内存实现。
+// useMemEnv 把环境变量与广播都换成内存实现，
+// 并把「写入记录文件」也重定向到临时目录（否则测试会写真实 ~/.ghsmart）。
 func useMemEnv(t *testing.T) (memEnv, *int) {
 	t.Helper()
+	t.Setenv("GHSMART_CLIPROXY_FILE", filepath.Join(t.TempDir(), "cliproxy_git.json"))
 	m := memEnv{}
 	n := 0
 	oldStore, oldBcast := envStoreFn, broadcastEnv
@@ -169,6 +172,95 @@ func TestToProxyURL(t *testing.T) {
 	for in, want := range cases {
 		if got := toProxyURL(in); got != want {
 			t.Fatalf("toProxyURL(%q) = %q，期望 %q", in, got, want)
+		}
+	}
+}
+
+// TestRemoveCLIProxyClearsStalePorts 是 v1.0.8 开发中真实踩坑的回归：
+// 旧实现按「端口等于固定值」删除，端口一变旧条目就永久残留，
+// 结果 ~/.gitconfig 里累积了 6 条指向已关闭端口的代理，git 彻底连不上。
+// 现在必须做到：不管端口是多少，只要是本机回环就清掉。
+func TestRemoveCLIProxyClearsStalePorts(t *testing.T) {
+	p := isolatedGit(t)
+	useMemEnv(t)
+
+	stale := []string{
+		"http://127.0.0.1:42649",
+		"http://127.0.0.1:30970",
+		"http://localhost:18080",
+		"http://[::1]:12000",
+	}
+	for _, v := range stale {
+		if out, err := runGit("config", "--global", "--add", gitProxyKey, v); err != nil {
+			t.Fatalf("预置 %s 失败: %v %s", v, err, out)
+		}
+	}
+	got := readGitConfig(t, p)
+	if !strings.Contains(got, "42649") {
+		t.Fatalf("预置失败，配置里应有残留:\n%s", got)
+	}
+
+	if err := RemoveCLIProxy(); err != nil {
+		t.Fatalf("RemoveCLIProxy 失败: %v", err)
+	}
+	after := readGitConfig(t, p)
+	for _, v := range stale {
+		if strings.Contains(after, v) {
+			t.Fatalf("残留条目 %s 未被清除（会导致 git 全不可用）:\n%s", v, after)
+		}
+	}
+}
+
+// TestRemoveCLIProxyKeepsRemoteProxy：用户自己配置的「公网/公司」代理必须保留，
+// 只有指向本机的才算我们的。
+func TestRemoveCLIProxyKeepsRemoteProxy(t *testing.T) {
+	p := isolatedGit(t)
+	useMemEnv(t)
+
+	const userProxy = "http://proxy.corp.example:8080"
+	if out, err := runGit("config", "--global", "--add", gitProxyKey, userProxy); err != nil {
+		t.Fatalf("预置用户代理失败: %v %s", err, out)
+	}
+	// 同时存在我们写的一条
+	if out, err := runGit("config", "--global", "--add", gitProxyKey, "http://127.0.0.1:18080"); err != nil {
+		t.Fatalf("预置我方代理失败: %v %s", err, out)
+	}
+
+	_ = RemoveCLIProxy()
+	after := readGitConfig(t, p)
+	if strings.Contains(after, "127.0.0.1:18080") {
+		t.Fatalf("我方回环代理应被清除:\n%s", after)
+	}
+	if !strings.Contains(after, userProxy) {
+		t.Fatalf("用户自己的公网代理被误删:\n%s", after)
+	}
+}
+
+// TestIsLoopbackProxy：回环识别（含 IPv6、用户名密码、大小写）。
+func TestIsLoopbackProxy(t *testing.T) {
+	yes := []string{
+		"http://127.0.0.1:18080",
+		"127.0.0.1:18080",
+		"http://localhost:7890",
+		"HTTP://LOCALHOST:1",
+		"http://[::1]:8080",
+		"http://user:pass@127.0.0.1:3128",
+	}
+	no := []string{
+		"http://proxy.corp.example:8080",
+		"http://10.0.0.5:3128",
+		"http://192.168.1.1:8080",
+		"socks5://127.0.0.2:1080",
+		"",
+	}
+	for _, v := range yes {
+		if !isLoopbackProxy(v) {
+			t.Fatalf("%q 应判定为本机回环", v)
+		}
+	}
+	for _, v := range no {
+		if isLoopbackProxy(v) {
+			t.Fatalf("%q 不应判定为本机回环（会被误删）", v)
 		}
 	}
 }

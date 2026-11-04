@@ -2,6 +2,7 @@ package main
 
 import (
 	"os"
+	"path/filepath"
 	"testing"
 	"time"
 )
@@ -9,11 +10,26 @@ import (
 // TestMain 把「强制退出」的默认实现换成空操作。
 // 否则任何调用 QuitApp 的测试都会在 watchdog 到点时被 os.Exit(0) 打死
 // （真实实现是给托盘退出兜底的，测试进程不需要）。
+//
+// 同时**必须隔离 git 全局配置**：app 层测试会走 startDeep → syncCLIProxy，
+// 也就是真的往 git 里写 http.https://github.com.proxy。不隔离的话，
+// 每跑一次测试就往开发机的 ~/.gitconfig 里塞一条指向随机端口的代理，
+// 跑几次之后 git 就彻底连不上网（这是 v1.0.8 开发中真实踩到的坑）。
 func TestMain(m *testing.M) {
 	origForce := forceQuit
 	forceQuit = func() {}
+
+	dir, err := os.MkdirTemp("", "ghsmart-apptest-")
+	if err == nil {
+		os.Setenv("GIT_CONFIG_GLOBAL", filepath.Join(dir, "gitconfig"))
+		os.Setenv("GIT_CONFIG_SYSTEM", os.DevNull)
+	}
+
 	code := m.Run()
 	forceQuit = origForce
+	if dir != "" {
+		_ = os.RemoveAll(dir)
+	}
 	os.Exit(code)
 }
 

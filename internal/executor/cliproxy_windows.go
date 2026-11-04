@@ -52,11 +52,14 @@ func ApplyCLIProxy(addr string, withEnv bool) (CLIProxyResult, error) {
 	if _, err := exec.LookPath("git"); err != nil {
 		res.Detail = "未检测到 git，已跳过 git 代理设置"
 	} else {
-		// 先清一次同键旧值，避免上次写入的端口残留（幂等）
-		_, _ = runGit("config", "--global", "--unset-all", "--fixed-value", gitProxyKey, envProxyValue)
+		// 先清掉所有「指向本机」的旧值，再写一条：避免端口变化后
+		// 旧条目残留在配置里（实测会累积成多条死代理，直接让 git 全废）。
+		removeGitProxyEntries()
 		if out, err := runGit("config", "--global", "--add", gitProxyKey, proxyURL); err != nil {
 			res.Detail = "git 代理写入失败: " + strings.TrimSpace(out)
 		} else {
+			// 记录「这一条是我们写的」，退出时才敢精确删掉它
+			saveProxyRecord([]string{proxyURL})
 			res.GitApplied = true
 		}
 	}
@@ -76,13 +79,15 @@ func ApplyCLIProxy(addr string, withEnv bool) (CLIProxyResult, error) {
 	return res, nil
 }
 
-// RemoveCLIProxy 精确撤销命令行代理：只删「值等于我们写的值」的条目。
+// RemoveCLIProxy 精确撤销命令行代理。
 //
-// 用户在软件运行期间自己改过代理设置（值变了）时一律不动——
-// 绝不能把用户新配的代理删掉。
+// git 侧只删「指向本机回环地址」的条目：那是我们写的（本地代理必然是回环），
+// 而用户自己配的 github.com 代理通常指向公网/公司代理，一律保留。
+// 这里刻意不按「端口等于固定值」匹配——监听端口可能变，
+// 按固定值删会漏掉旧条目，残留的死代理会让 git 全不可用。
 func RemoveCLIProxy() error {
 	if _, err := exec.LookPath("git"); err == nil {
-		_, _ = runGit("config", "--global", "--unset-all", "--fixed-value", gitProxyKey, envProxyValue)
+		removeGitProxyEntries()
 	}
 	removeUserEnvProxy()
 	return nil

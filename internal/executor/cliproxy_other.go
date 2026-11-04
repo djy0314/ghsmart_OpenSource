@@ -12,8 +12,9 @@ func ApplyCLIProxy(addr string, _ bool) (CLIProxyResult, error) {
 	if proxyURL == "" {
 		return res, nil
 	}
-	_, _ = runGit("config", "--global", "--unset-all", "--fixed-value", gitProxyKey, envProxyValue)
+	removeGitProxyEntries()
 	if _, err := runGit("config", "--global", "--add", gitProxyKey, proxyURL); err == nil {
+		saveProxyRecord([]string{proxyURL})
 		res.GitApplied = true
 	}
 	return res, nil
@@ -21,6 +22,6 @@ func ApplyCLIProxy(addr string, _ bool) (CLIProxyResult, error) {
 
 // RemoveCLIProxy 精确撤销命令行代理。
 func RemoveCLIProxy() error {
-	_, _ = runGit("config", "--global", "--unset-all", "--fixed-value", gitProxyKey, envProxyValue)
+	removeGitProxyEntries()
 	return nil
 }
