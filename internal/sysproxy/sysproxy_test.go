@@ -267,3 +267,37 @@ func TestApplyFixesDirtyBypassWhenAlreadyOurs(t *testing.T) {
 		t.Fatalf("老版本遗留的脏 bypass 未被清理: %v", left)
 	}
 }
+
+// TestDisableIfOwned：僵尸代理清理的核心——只关「指向我们」的代理，
+// 第三方代理（Clash 7890 等）绝不能被误杀。
+func TestDisableIfOwned(t *testing.T) {
+	// 情形一：系统代理指向我们的死端口 → 强制关闭（只动 Enable，Server 留原样）
+	st := &memStore{v: Values{Enable: 1, Server: target, Override: "*.cn", HasOverride: true}}
+	ok, err := disableIfOwnedWith(st, target)
+	if err != nil {
+		t.Fatalf("disable 失败: %v", err)
+	}
+	if !ok {
+		t.Fatal("指向我们的代理应被关闭")
+	}
+	if st.v.Enable != 0 {
+		t.Fatalf("ProxyEnable 应为 0，实际 %+v", st.v)
+	}
+
+	// 情形二：第三方代理 → 绝不动
+	st2 := &memStore{v: Values{Enable: 1, Server: "127.0.0.1:7890"}}
+	ok2, err := disableIfOwnedWith(st2, target)
+	if err != nil || ok2 {
+		t.Fatalf("第三方代理不应被碰（ok=%v err=%v）", ok2, err)
+	}
+	if st2.v.Enable != 1 {
+		t.Fatal("第三方代理配置必须原样保留")
+	}
+
+	// 情形三：代理已关闭 → no-op
+	st3 := &memStore{v: Values{Enable: 0}}
+	ok3, err := disableIfOwnedWith(st3, target)
+	if err != nil || ok3 {
+		t.Fatalf("已关闭的代理应 no-op（ok=%v err=%v）", ok3, err)
+	}
+}

@@ -258,7 +258,7 @@
   <header>
     <svg class="logo" viewBox="0 0 512 512"><rect x="16" y="16" width="480" height="480" rx="96" fill="#0f172a" stroke="#38bdf8" stroke-width="12"/><polygon points="300,60 170,270 250,270 200,452 360,230 270,230 330,60" fill="#34d399"/></svg>
     <h1>ghsmart</h1>
-    <span class="ver" id="ver-text">Free v1.0.1 · 纯本地加速</span>
+    <span class="ver" id="ver-text">Free v1.0.2 · 纯本地加速</span>
     <button id="clear-lic" type="button" title="删除本地授权文件并回到 Free 状态（测试用）">清除授权</button>
   </header>
 
@@ -471,7 +471,7 @@
         } else {
           deep.title = "Pro 功能：本地 TLS 分片代理，绕过 SNI 阻断（无需安装任何证书）。公司 VPN（深信服 aTrust 等）环境请勾选兼容模式，或仅使用一键智能加速";
         }
-        if (verTxt) verTxt.textContent = "Pro v1.0.1 · 已授权";
+        if (verTxt) verTxt.textContent = "Pro v1.0.2 · 已授权";
       } else {
         box.classList.remove("unlocked", "healing");
         deep.classList.remove("unlocked", "on");
@@ -481,7 +481,7 @@
         if (deepLock) deepLock.textContent = "🔒";
         if (healTxt) healTxt.textContent = "";
         if (deepTxt) deepTxt.textContent = "";
-        if (verTxt) verTxt.textContent = "Free v1.0.1 · 纯本地加速";
+        if (verTxt) verTxt.textContent = "Free v1.0.2 · 纯本地加速";
       }
     }
 
@@ -556,6 +556,12 @@
         const list = (d.updated || []).map((u) => `${u.domain}: ${u.from} → ${u.to}`).join("；");
         setStatus("已为您更新更优 IP", "ok");
         toast(`已为您更新更优 IP（${d.updated.length} 条）：${list}`, "ok");
+      });
+
+      EventsOn("deep:proxydead", (d) => {
+        // 看门狗：后台代理崩溃/唤醒后失效且自动恢复失败 —— 明确告诉用户，绝不静默
+        setStatus("代理已失效，请重新开启深度加速", "err");
+        toast("⚠️ 代理已失效，请重新开启深度加速" + (d && d.error ? "（" + d.error + "）" : ""), "err");
       });
 
       EventsOn("engine:applied", (d) => {

@@ -418,6 +418,21 @@ func (s *Server) Addr() string {
 	return s.ln.Addr().String()
 }
 
+// DropConns 断开全部在途连接，但保持监听不动。
+// 用于系统休眠唤醒后：所有 TCP 连接的对端早已失效，与其等它们逐个超时
+// 卡住浏览器，不如全部立刻断开让浏览器重连（新连接走新路由）。
+func (s *Server) DropConns() {
+	s.mu.Lock()
+	conns := make([]net.Conn, 0, len(s.conns))
+	for c := range s.conns {
+		conns = append(conns, c)
+	}
+	s.mu.Unlock()
+	for _, c := range conns {
+		_ = c.Close() // serve 的 track(defer) 会把它们从表里摘掉
+	}
+}
+
 // Stop 关闭监听并断开所有在途隧道（关闭深度加速时要立刻放行直连）。
 func (s *Server) Stop() error {
 	s.mu.Lock()

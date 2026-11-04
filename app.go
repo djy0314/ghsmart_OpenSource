@@ -58,6 +58,15 @@ type App struct {
 	ipMu    sync.Mutex
 	ipCache map[string]ipEntry
 
+	// 看门狗：休眠唤醒恢复 + 代理失效捕捉 + 自愈卡死复位。
+	// wdCancel 停止看门狗；deadStreak 是代理连续无响应计数（防瞬时抖动误报）；
+	// healBusySince/healLastDone 记录自愈循环的繁忙起点（unix 秒，0=空闲），
+	// 用于发现「自愈卡死后 busy 永远为 true」的僵局。
+	wdMu      sync.Mutex
+	wdCancel  context.CancelFunc
+	deadStreak atomic.Int32
+	healBusySince atomic.Int64
+
 	// 诊断日志（GUI 无控制台，写 ~/.ghsmart/ghsmart.log）
 	logMu   sync.Mutex
 	logFile *os.File
@@ -81,6 +90,10 @@ func (a *App) startup(ctx context.Context) {
 	} else if restored {
 		a.emitStatus("已自动还原上次遗留的系统代理", "ok")
 	}
+	// 第二道闸：僵尸代理清理。备份可能在强杀时根本没写成/被删，
+	// 只要「系统代理指向我们的端口但端口无人监听」就强制关闭——
+	// 绝不让用户一开机就全网断连（公司域名全打不开的那种）。
+	a.cleanZombieProxy(cfg.WebProxy.Listen)
 	if st := a.loadLicenseState(); st.Key != "" {
 		if ok, err := license.VerifyOffline(st.Key); err == nil && ok {
 			a.pro.Store(true)
@@ -101,7 +114,205 @@ func (a *App) startup(ctx context.Context) {
 	// ★ 缓存秒应用：上次探测成功的最优 IP 直接恢复加速（免费版无条件），
 	// 打开软件即用，无需再点按钮；随后后台静默校验更优 IP。
 	a.applyCacheOnStartup(cfg)
+	// ★ 看门狗：休眠唤醒恢复 + 代理失效捕捉 + 自愈卡死复位（免费/通用，开销极小）
+	a.startWatchdog()
 	a.emitState()
+}
+
+// ---------- 看门狗：休眠唤醒 / 代理失效 / 自愈卡死 ----------
+
+// wdInterval 是看门狗的巡检间隔。声明成变量是为了测试能缩短它。
+var wdInterval = 5 * time.Second
+
+// wdWakeGap 是「判定发生了休眠唤醒」的心跳缺口阈值：一次正常巡检间隔的
+// 4 倍以上没跳（系统挂起导致定时器被冻结）就视为刚从睡眠/休眠中唤醒。
+var wdWakeGap = 4 * 5 * time.Second
+
+// wdDeadStreakLimit 是深度代理连续无响应多少次才判定失效（防瞬时抖动误报）。
+var wdDeadStreakLimit int32 = 2
+
+// healStallTimeout 是自愈循环繁忙多久判定为卡死。
+var healStallTimeout = 15 * time.Minute
+
+// deepAliveProbe 是代理端口探活实现（测试可替换）：TCP 能连上即视为活着。
+var deepAliveProbe = func(addr string, timeout time.Duration) bool {
+	c, err := net.DialTimeout("tcp", addr, timeout)
+	if err != nil {
+		return false
+	}
+	_ = c.Close()
+	return true
+}
+
+// zombieIsOn / zombieDisable / zombiePortAlive 是僵尸代理清理的系统触点
+//（测试可替换，绝不碰真实注册表）。
+var zombieIsOn = sysproxy.IsOn
+var zombieDisable = sysproxy.DisableIfOwned
+
+// startWatchdog 启动看门狗循环（幂等：重复调用先停旧的）。
+// 管三件事：① 休眠唤醒后的资源重置；② 深度代理失效的捕捉与自动恢复；
+// ③ 自愈循环卡死时的强制复位。Free/Pro 都跑，开销一次 TCP 探活以内。
+func (a *App) startWatchdog() {
+	ctx, cancel := context.WithCancel(context.Background())
+	a.wdMu.Lock()
+	if a.wdCancel != nil {
+		a.wdCancel() // 停旧循环
+	}
+	a.wdCancel = cancel
+	a.wdMu.Unlock()
+
+	go func() {
+		last := time.Now()
+		ticker := time.NewTicker(wdInterval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case now := <-ticker.C:
+				if gap := now.Sub(last); gap > wdWakeGap {
+					a.onWake(gap)
+				}
+				last = now
+				a.checkDeepAlive()
+				a.checkHealStall()
+			}
+		}
+	}()
+}
+
+// stopWatchdog 停止看门狗循环（退出时调用，幂等）。
+func (a *App) stopWatchdog() {
+	a.wdMu.Lock()
+	defer a.wdMu.Unlock()
+	if a.wdCancel != nil {
+		a.wdCancel()
+		a.wdCancel = nil
+	}
+}
+
+// onWake 在系统从休眠/睡眠唤醒后被调用：休眠前的 TCP 连接、DNS/优选缓存
+// 全部不可信，必须重置；代理端口若已死，走统一的失效恢复路径。
+func (a *App) onWake(gap time.Duration) {
+	a.logf("看门狗：检测到系统唤醒（心跳缺口 %v），重置网络资源", gap.Round(time.Second))
+	// 1. 优选 IP 解析缓存作废：休眠前解析的 IP 在新网络环境里可能全失效
+	a.ipMu.Lock()
+	a.ipCache = make(map[string]ipEntry)
+	a.ipMu.Unlock()
+	// 2. 深度代理的在途连接全部断开（保持监听），浏览器重连即走新路由
+	a.deepMu.Lock()
+	p := a.proxy
+	a.deepMu.Unlock()
+	if p != nil {
+		p.DropConns()
+	}
+	// 3. 代理端口活性立即复核（不等下一轮巡检）
+	a.checkDeepAlive()
+}
+
+// deepListenAddr 返回深度代理当前监听地址（未启动为空）。
+func (a *App) deepListenAddr() string {
+	a.deepMu.Lock()
+	defer a.deepMu.Unlock()
+	if a.proxy == nil {
+		return ""
+	}
+	return a.proxy.Addr()
+}
+
+// checkDeepAlive 是代理失效的捕捉与恢复：deepOn 为真时探活监听端口，
+// 连续 wdDeadStreakLimit 次连不上 → 判定失效 → 用同样的模式自动重启一次；
+// 重启也失败才广播 UI（「代理已失效，请重新开启」），绝不静默卡死。
+func (a *App) checkDeepAlive() {
+	if !a.deepOn.Load() {
+		a.deadStreak.Store(0)
+		return
+	}
+	addr := a.deepListenAddr()
+	if addr == "" || !deepAliveProbe(addr, 900*time.Millisecond) {
+		if a.deadStreak.Add(1) < wdDeadStreakLimit {
+			return // 偶发一次连不上可能只是瞬时抖动，再观察一轮
+		}
+	} else {
+		a.deadStreak.Store(0)
+		return
+	}
+	a.deadStreak.Store(0)
+	mode := a.deepMode
+	compat := a.deepCompat
+	a.logf("看门狗：深度代理 %s 连续无响应，判定失效，尝试自动恢复（mode=%s compat=%v）", addr, mode, compat)
+	cfg := deepRecoverCfg(a)
+	a.stopDeep()
+	if err := a.startDeep(cfg, mode, compat); err != nil {
+		a.logf("看门狗：代理自动恢复失败: %v", err)
+		a.emitStatus("代理已失效，请重新开启深度加速", "err")
+		emitProxyDead(a, addr, err.Error())
+		return
+	}
+	a.logf("看门狗：深度代理已自动恢复（新地址 %s）", a.deepListenAddr())
+	a.emitStatus("检测到代理失去响应，已自动恢复深度加速", "warn")
+}
+
+// deepRecoverCfg 是看门狗恢复代理时的配置来源（测试可替换）。
+var deepRecoverCfg = func(a *App) *config.Config { return a.loadCfg() }
+
+// emitProxyDead 向前端广播「代理已失效」事件（测试可替换）。
+var emitProxyDead = func(a *App, addr, errMsg string) {
+	if a.ctx == nil {
+		return
+	}
+	runtime.EventsEmit(a.ctx, "deep:proxydead", map[string]any{
+		"addr": addr, "error": errMsg,
+	})
+}
+
+// checkHealStall 在自愈循环「busy 置位后长时间不归还」时强制复位，
+// 防止一次卡死的探测把整个自愈循环变成永远跳过本轮的僵尸。
+func (a *App) checkHealStall() {
+	if !a.healOn.Load() || !a.busy.Load() {
+		return
+	}
+	since := a.healBusySince.Load()
+	if since == 0 {
+		return
+	}
+	if time.Since(time.Unix(since, 0)) < healStallTimeout {
+		return
+	}
+	a.healBusySince.Store(0)
+	a.busy.Store(false) // 复位：下一轮自愈不再被永久跳过
+	a.logf("看门狗：后台自愈繁忙超过 %v，疑似卡死，已强制复位", healStallTimeout)
+	a.emitStatus("后台自愈疑似卡死，已强制复位（不影响深度加速）", "warn")
+}
+
+// ---------- 僵尸代理清理（启动自检） ----------
+
+// cleanZombieProxy 是启动自检的核心修复（防强杀残留的「僵尸代理」）：
+// 系统代理指向我们的监听地址，但本程序此刻并没有在监听该端口——
+// 正常只有开深度加速才会写代理，所以这一定是上次强杀/崩溃残留的死代理。
+// 直接强制关闭系统代理（ProxyEnable=0），绝不让用户一开机就全网断连。
+//
+// 与 Recover（按备份精准还原）互补：备份丢了/没写成时，这道闸保证兜底。
+func (a *App) cleanZombieProxy(listen string) {
+	target := listen
+	if target == "" {
+		target = sysproxy.DefaultTarget
+	}
+	if !zombieIsOn(target) {
+		return // 系统代理没指向我们，无事可做（第三方代理绝不误杀）
+	}
+	if a.deepListenAddr() != "" {
+		return // 我们自己确实在监听（理论上启动早期不会发生），不误杀
+	}
+	ok, err := zombieDisable(target)
+	if err != nil {
+		a.emitStatus("僵尸代理清理失败: "+err.Error(), "err")
+		return
+	}
+	if ok {
+		a.logf("启动自检：检测到强杀残留的僵尸代理（%s 无人监听），已强制关闭系统代理", target)
+		a.emitStatus("检测到上次异常退出残留的失效代理，已自动关闭（网络已恢复直连）", "warn")
+	}
 }
 
 // loadCfg 加载配置：优先 exe 同目录 configs/default.yaml，读不到用内置默认。
@@ -426,9 +637,16 @@ func (a *App) allowCloseOnX() bool {
 }
 
 // quitWatchdogDelay 是「请求退出」到「强制结束进程」的等待时间。
-// 正常退出远快于此；留够时间让 Wails 先走完 OnBeforeClose / OnShutdown。
+// 正常退出远快于此；留够时间让 Wails 先走完 OnBeforeClose / OnShutdown，
+// 也给「退出清场超时放弃等待」留出后台 goroutine 收尾的余量。
 // 声明成变量是为了测试能缩短它（测试进程不能被 os.Exit 打死）。
-var quitWatchdogDelay = 2 * time.Second
+var quitWatchdogDelay = 3 * time.Second
+
+// exitCleanupTimeout 是退出清场（还原代理/停循环）的等待上限。
+// 清场若卡住（休眠唤醒后代理句柄异常等）超过它，直接放弃等待优先退出，
+// 防止 UI 卡死；后台 goroutine 会继续跑完还原，watchdog 强退前还会再兜底一次。
+// 声明成变量同样是为了测试可缩短。
+var exitCleanupTimeout = 2 * time.Second
 
 // forceQuit 是退出兜底的执行体：先撤托盘（避免幽灵图标），再强制结束进程。
 // 声明成变量同样是为了测试可替换。
@@ -452,7 +670,19 @@ func (a *App) QuitApp() {
 		return // 已经在退出流程中，重复点击直接忽略
 	}
 	a.logf("用户请求退出：还原系统代理并关闭进程")
-	a.Shutdown() // 幂等：还原代理、停自愈、关日志
+	// 清场带超时保护：正常毫秒级完成；一旦卡住（休眠唤醒后句柄异常等）
+	// 最多等 exitCleanupTimeout 就放弃等待优先退出，绝不把 UI 卡死。
+	// 清场 goroutine 自身会继续跑完（还原代理最要紧），watchdog 也会兜底。
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		a.Shutdown() // 幂等：还原代理、停自愈、停看门狗、关日志
+	}()
+	select {
+	case <-done:
+	case <-time.After(exitCleanupTimeout):
+		a.logf("退出清场超过 %v 未完成，放弃等待优先退出", exitCleanupTimeout)
+	}
 
 	if a.ctx != nil {
 		runtime.Quit(a.ctx)
@@ -477,6 +707,7 @@ func (a *App) QuitApp() {
 func (a *App) Shutdown() {
 	a.stopDeep()
 	a.stopHeal()
+	a.stopWatchdog()
 	a.closeLog()
 }
 
@@ -672,9 +903,11 @@ func (a *App) startHeal(cfg *config.Config) {
 				if !a.busy.CompareAndSwap(false, true) {
 					continue // 上一轮还没跑完，跳过本周期
 				}
+				a.healBusySince.Store(time.Now().Unix()) // 看门狗据此发现卡死
 				a.emitStatus("后台自愈: 正在巡检...", "busy")
 				_, _, _, err := engine.ApplyOnce(cfg, guiReporter{a})
 				a.busy.Store(false)
+				a.healBusySince.Store(0)
 				if err != nil {
 					a.emitStatus("后台自愈: "+err.Error(), "err")
 					continue

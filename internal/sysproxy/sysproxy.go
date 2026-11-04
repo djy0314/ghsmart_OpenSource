@@ -91,6 +91,29 @@ func IsOn(target string) bool {
 	return ownedBy(v, target)
 }
 
+// DisableIfOwned 在系统代理仍指向 target 时强制关闭（ProxyEnable=0，不查备份）。
+//
+// 用于「僵尸代理」清理：进程被强杀后系统代理还指着本机死端口，此时还原备份
+// 已无意义（端口都没人监听了），直接关掉代理恢复直连，绝不让用户一开机就断网。
+// 只处理「指向我们」的状态，第三方代理（Clash 等）绝不误杀。
+func DisableIfOwned(target string) (bool, error) {
+	return disableIfOwnedWith(defaultStore(), target)
+}
+
+func disableIfOwnedWith(st Store, target string) (bool, error) {
+	cur, err := st.Read()
+	if err != nil {
+		return false, fmt.Errorf("读取系统代理失败: %w", err)
+	}
+	if !ownedBy(cur, target) {
+		return false, nil // 不是我们的状态，不动
+	}
+	if err := st.Write(Values{Enable: 0}); err != nil {
+		return false, fmt.Errorf("关闭系统代理失败: %w", err)
+	}
+	return true, nil
+}
+
 // Current 返回当前系统代理设置（UI 展示用）。
 func Current() Values {
 	v, err := defaultStore().Read()
