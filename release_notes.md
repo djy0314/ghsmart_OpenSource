@@ -28,6 +28,13 @@
   下载约 10MB
 - 私钥经审查从未进入仓库历史（13 个提交全量 grep 零命中），本次是预防性加固
 
+## 📦 下载与校验（v1.0.6）
+
+```
+SHA256(ghsmart_v1.0.6.zip): 5F560E7E2795D7D807C6AA5CB9F5674631DA4B1735C2D9AE058C361175FED1AF
+SHA256(ghsmart.exe):        CD4B44248EF7DCEE3539A0FE29D082AA44AD57213363C1D88C4D1CE019949E6C
+```
+
 ---
 
 # ghsmart v1.0.5 — 解析层提速：DoH 并发竞速，开启从「等 10 秒」到「秒开」
