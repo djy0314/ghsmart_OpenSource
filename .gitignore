@@ -1,4 +1,10 @@
 # ===== 红线：绝不入库 =====
+# 通配兜底：任何私钥/密钥容器格式一律不许入库（具体文件名可能变，扩展名不会）
+*.pem
+*.key
+*.pfx
+*.p12
+*.bin
 keygen_private.pem
 keygen_private.bin
 keygen.exe
@@ -11,6 +17,7 @@ tools/keygen-migrate/
 internal/keyring/
 
 # ===== 构建产物 / 本地产物 =====
+*.syso
 build/
 .uitest/
 ghsmart_release/

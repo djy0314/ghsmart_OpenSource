@@ -1,0 +1,57 @@
+#!/bin/sh
+# ghsmart pre-commit guard.
+# Blocks private keys, keygen sources and release binaries from ever entering git.
+#
+# Install once per clone:   git config core.hooksPath tools/git-hooks
+# Bypass (only when certain): git commit --no-verify
+#
+# Why this exists: ghsmart_OpenSource is a PUBLIC repository. The ECDSA private
+# key lives only in %LOCALAPPDATA%\ghsmart\keygen_private.bin (DPAPI). If it ever
+# reaches GitHub, the commercial licensing loop is over. .gitignore is not enough
+# because "git add -f" ignores it silently -- this hook is the second wall.
+
+blocked=0
+
+block() {
+    printf 'BLOCKED  %s\n' "$1" >&2
+    blocked=1
+}
+
+tmp=$(mktemp 2>/dev/null || echo /tmp/ghsmart_precommit.$$)
+git diff --cached --name-only --diff-filter=ACMR > "$tmp" 2>/dev/null
+
+while IFS= read -r f; do
+    [ -z "$f" ] && continue
+    lower=$(printf '%s' "$f" | tr 'A-Z' 'a-z')
+
+    case "$lower" in
+        *.pem|*.key|*.pfx|*.p12|*.bin)
+            block "sensitive key container: $f" ;;
+        *keygen*|*keyring*)
+            block "keygen/keyring artifact: $f" ;;
+        *.exe|*.zip)
+            block "release binary: $f" ;;
+    esac
+done < "$tmp"
+
+# Content scan: a PEM private key body hidden inside any staged blob.
+while IFS= read -r f; do
+    [ -z "$f" ] && continue
+    if git show ":$f" 2>/dev/null | head -c 262144 | grep -q -a -E -- '-----BEGIN [A-Z ]*PRIVATE KEY-----'; then
+        block "PEM private key body inside: $f"
+    fi
+done < "$tmp"
+
+rm -f "$tmp"
+
+if [ "$blocked" -ne 0 ]; then
+    echo "" >&2
+    echo "=== Commit rejected by ghsmart secret guard ===" >&2
+    echo "Private keys must stay in %LOCALAPPDATA%\\ghsmart\\ and never enter git." >&2
+    echo "Keygen sources and release binaries are also excluded by policy." >&2
+    echo "" >&2
+    echo "False positive? Re-run with: git commit --no-verify" >&2
+    exit 1
+fi
+
+exit 0

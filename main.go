@@ -20,6 +20,7 @@ import (
 
 	"ghsmart/internal/jobobj"
 	"ghsmart/internal/proxyguard"
+	"ghsmart/internal/selfcheck"
 )
 
 //go:embed all:frontend/dist
@@ -29,6 +30,14 @@ var assets embed.FS
 var trayIcon []byte
 
 func main() {
+	// 启动自校验（仅发布构建带 -tags selfcheck 时编入）：
+	// 校验自身 exe 是否被改过。必须在任何业务逻辑和窗口之前——校验失败时
+	// 只弹一次系统提示框然后退出，绝不允许出现主界面。
+	// 开发构建不带该 tag，Verify 是空实现，零开销。
+	if err := selfcheck.Verify(); err != nil {
+		selfcheck.Fail(err.Error())
+	}
+
 	// 守卫进程分支：必须在任何 GUI/托盘初始化之前处理，
 	// 否则守卫会再开一个窗口、再派生一个守卫，无限递归。
 	if len(os.Args) > 1 && os.Args[1] == proxyguard.GuardArg {
