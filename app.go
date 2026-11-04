@@ -169,15 +169,21 @@ func (a *App) cleanZombieProxy(listen string) {
 }
 
 // loadCfg 加载配置：优先 exe 同目录 configs/default.yaml，读不到用内置默认。
+// GHSMART_LISTEN 环境变量可覆盖监听地址（单测注入随机端口用，生产不设置）。
 func (a *App) loadCfg() *config.Config {
+	var cfg *config.Config
 	if exe, err := os.Executable(); err == nil {
 		p := filepath.Join(filepath.Dir(exe), "configs", "default.yaml")
-		if cfg, err := config.Load(p); err == nil {
-			engine.Configure(cfg)
-			return cfg
+		if c, err := config.Load(p); err == nil {
+			cfg = c
 		}
 	}
-	cfg, _ := config.Load("") // 文件缺失时 config.Load 自动回退默认值
+	if cfg == nil {
+		cfg, _ = config.Load("") // 文件缺失时 config.Load 自动回退默认值
+	}
+	if lp := os.Getenv("GHSMART_LISTEN"); lp != "" {
+		cfg.WebProxy.Listen = lp
+	}
 	engine.Configure(cfg)
 	return cfg
 }

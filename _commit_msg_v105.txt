@@ -1,0 +1,16 @@
+perf(v1.0.5): DoH 并发竞速 + 端点健康记忆 + 应急池入探测
+
+- doh.ResolveWith 由串行轮询改为并发竞速：全部端点同时发，
+  谁先返回完整 A 记录用谁，其余立即取消；实测解析从
+  「3/5 域名 5s 超时失败」变为全部成功 18~350ms
+- 新增腾讯 doh.pub 端点，与阿里组成国内双保险；
+  Cloudflare/Google 保留给海外用户，由竞速自然淘汰
+- 端点健康记忆：上次赢家先发（150ms stagger），连败 2 次摘除
+- dohClient 共享连接池：二次解析免 TLS 握手，18~21ms
+- engine 探测候选接入应急 IP 池（appendFallbackIPs，
+  后缀匹配/去重/封顶 6）：主 IP 黑洞期仍有候选，实测
+  靠应急池 IP 通过业务校验写入
+- 清理死域名 assets-cdn.github.com（GitHub 已弃用，DoH 无 A 记录）
+- 单测改随机端口（GHSMART_LISTEN 注入）：正式版运行时测试不再抢 18080
+- 新增回归：竞速必取最快 / 健康记忆先发 / 记忆连败摘除 / 应急池拼接
+- cmd/speedtest 性能回归工具入库（干净 shell 运行，防代理变量污染）

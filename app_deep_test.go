@@ -27,6 +27,8 @@ func stubGuardAndStore(t *testing.T) *atomic.Int32 {
 	t.Helper()
 	t.Setenv("GHSMART_LICENSE_FILE", filepath.Join(t.TempDir(), "license.json"))
 	t.Setenv("GHSMART_SYSPROXY_FILE", filepath.Join(t.TempDir(), "sysproxy.bak.json"))
+	// 随机端口：正式版 ghsmart 可能正在真机监听 18080，绝不能跟它抢
+	t.Setenv("GHSMART_LISTEN", "127.0.0.1:0")
 	spawned := &atomic.Int32{}
 	oldSpawn := guardSpawn
 	guardSpawn = func(_ *jobobj.Job, _ string) (*proxyguard.Guard, error) {

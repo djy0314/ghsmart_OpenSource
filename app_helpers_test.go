@@ -25,12 +25,14 @@ func withTempProbeReport(t *testing.T, report map[string][]cache.ProbeRecord) {
 }
 
 // a0Config 返回默认配置（不依赖外部文件）。
+// 监听地址改为随机端口：单测绝不能跟正在真机运行的正式版抢 18080。
 func a0Config(t *testing.T) *config.Config {
 	t.Helper()
 	cfg, err := config.Load("")
 	if err != nil {
 		t.Fatalf("加载默认配置失败: %v", err)
 	}
+	cfg.WebProxy.Listen = "127.0.0.1:0"
 	return cfg
 }
 

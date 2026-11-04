@@ -1,8 +1,10 @@
 package engine
 
 import (
+	"reflect"
 	"testing"
 
+	"ghsmart/internal/config"
 	"ghsmart/internal/decision"
 	"ghsmart/internal/probe"
 )
@@ -103,5 +105,34 @@ func TestStateForDomain(t *testing.T) {
 	clearInUseForDomain(state, "a.com")
 	if currentIPInDomain(state, "a.com") != "" || currentIPInDomain(state, "b.com") != "2.2.2.2" {
 		t.Fatal("clearInUseForDomain 影响了其他域名")
+	}
+}
+
+// TestAppendFallbackIPs：应急池候选拼接——后缀匹配、去重、封顶。
+func TestAppendFallbackIPs(t *testing.T) {
+	pools := []config.FallbackGroup{
+		{Suffix: ".github.com", IPs: []string{"140.82.112.3", "140.82.113.3"}},
+		{Suffix: ".githubusercontent.com", IPs: []string{"185.199.108.133"}},
+	}
+	// 后缀命中 + 去重
+	got := appendFallbackIPs([]string{"20.205.243.166"}, pools, "github.com", 6)
+	want := []string{"20.205.243.166", "140.82.112.3", "140.82.113.3"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("github.com 候选应含应急池: got %v want %v", got, want)
+	}
+	// 子域名命中
+	got = appendFallbackIPs(nil, pools, "raw.githubusercontent.com", 6)
+	if !reflect.DeepEqual(got, []string{"185.199.108.133"}) {
+		t.Fatalf("子域名应命中后缀: %v", got)
+	}
+	// 不匹配的域名不追加
+	got = appendFallbackIPs([]string{"1.1.1.1"}, pools, "example.com", 6)
+	if !reflect.DeepEqual(got, []string{"1.1.1.1"}) {
+		t.Fatalf("无关域名不应追加: %v", got)
+	}
+	// 封顶
+	got = appendFallbackIPs([]string{"a", "b", "c"}, pools, "github.com", 4)
+	if len(got) != 4 {
+		t.Fatalf("应封顶 4: %v", got)
 	}
 }

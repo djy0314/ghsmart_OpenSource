@@ -61,8 +61,16 @@ func TruncateIPs(ips []string, n int) []string {
 	return ips[:n]
 }
 
+// maxTotalCandidates 是候选池的总上限（DoH 截断结果 + 应急池附加）。
+const maxTotalCandidates = 6
+
 // ResolveAndProbe 对单个域名完成 DoH 解析与 IP 探测，返回探测结果。
 // 候选池按 cfg.MaxProbeIPs 截断（默认 3），测完即决策，不等长尾 IP。
+//
+// 应急池附加（v1.0.5）：DoH 结果之后把配置里的应急 IP 一并送进探测——
+// 国内 DoH 对 github.com 常常只返回单个 IP，赶上该 IP 被黑洞，
+// 探测阶段就再无候选可选。应急 IP 同样要过探测 + 真实业务校验两道关，
+// 死 IP 依然不会写入 Hosts，只是让「活着的官方 IP」多一次入选机会。
 func ResolveAndProbe(ctx context.Context, cfg *config.Config, domain string) ([]probe.ProbeResult, error) {
 	timeout, err := cfg.ProbeTimeoutDuration()
 	if err != nil {
@@ -73,10 +81,42 @@ func ResolveAndProbe(ctx context.Context, cfg *config.Config, domain string) ([]
 		return nil, err
 	}
 	ipStrs := TruncateIPs(doh.DedupIPStrings(ips), cfg.MaxProbeIPs)
+	ipStrs = appendFallbackIPs(ipStrs, cfg.WebProxy.FallbackIPs, domain, maxTotalCandidates)
 	if len(ipStrs) == 0 {
 		return nil, fmt.Errorf("域名 %s 未解析到任何 IP", domain)
 	}
 	return probe.ProbeIPs(ctx, ipStrs, domain, timeout), nil
+}
+
+// appendFallbackIPs 把匹配域名后缀的应急 IP 追加进候选池（去重、封顶 max）。
+func appendFallbackIPs(cands []string, pools []config.FallbackGroup, domain string, max int) []string {
+	domain = strings.ToLower(strings.TrimSpace(domain))
+	for _, g := range pools {
+		suffix := strings.ToLower(strings.TrimPrefix(strings.TrimSpace(g.Suffix), "."))
+		if suffix == "" || (domain != suffix && !strings.HasSuffix(domain, "."+suffix)) {
+			continue
+		}
+		for _, ip := range g.IPs {
+			ip = strings.TrimSpace(ip)
+			if ip == "" {
+				continue
+			}
+			dup := false
+			for _, c := range cands {
+				if c == ip {
+					dup = true
+					break
+				}
+			}
+			if !dup {
+				cands = append(cands, ip)
+			}
+			if len(cands) >= max {
+				return cands
+			}
+		}
+	}
+	return cands
 }
 
 // PickChosen 根据决策结果决定该域名写入 Hosts 的 IP。

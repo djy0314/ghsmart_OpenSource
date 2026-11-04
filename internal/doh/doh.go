@@ -8,22 +8,65 @@ import (
 	"context"
 	"crypto/tls"
 	"fmt"
-	"math/rand"
 	"net"
 	"net/http"
+	"sync/atomic"
 	"time"
 
 	"github.com/miekg/dns"
 )
 
 // requestTimeout 是单次 DoH 请求的超时时间。
+// 并发竞速下它只是单个端点的兜底闸：慢端点不会拖住整体，
+// 赢家一出现其余请求立刻被 ctx 取消，根本等不到这个超时。
 const requestTimeout = 5 * time.Second
 
-// DefaultEndpoints 是未显式配置时可用的公共 DoH 端点。
+// DefaultEndpoints 是可用的公共 DoH 端点。
+// 国内双保险在前（阿里 + 腾讯），Cloudflare/Google 留给海外用户——
+// 并发竞速下顺序不影响延迟，只影响「同样快时优先采信谁」。
 var DefaultEndpoints = []string{
+	"https://dns.alidns.com/dns-query",
+	"https://doh.pub/dns-query",
 	"https://cloudflare-dns.com/dns-query",
 	"https://dns.google/dns-query",
-	"https://dns.alidns.com/dns-query",
+}
+
+// 端点健康记忆：上次赢家下次先发（raceStagger 的提前量），其余端点错峰兜底。
+// 这样正常情况只有一个请求在飞（省流量、结果稳定不抖动），
+// 赢家一旦变慢/被墙，错峰大军 150ms 后自动压上，用户无感。
+var (
+	goodEndpoint atomic.Value // string：上次解析成功的端点
+	goodFails    atomic.Int32 // 记忆端点连续失败次数（>=2 清除记忆）
+
+	// raceStagger 是非记忆端点相对记忆端点的起跑延迟；无记忆时全部 0ms 齐发。
+	// 包级变量以便单测调小/调大。
+	raceStagger = 150 * time.Millisecond
+)
+
+// noteGood 记录赢家端点，并清零其连败计数。
+func noteGood(ep string) {
+	goodFails.Store(0)
+	goodEndpoint.Store(ep)
+}
+
+// noteGoodFail 给记忆端点记一次失败；连续失败 2 次就摘除记忆，
+// 避免一个已死的端点长期霸占先发位（每次白送它 raceStagger 的提前量）。
+func noteGoodFail() {
+	if goodFails.Add(1) >= 2 {
+		goodEndpoint.Store("")
+		goodFails.Store(0)
+	}
+}
+
+// dohClient 是包级共享的 HTTP 客户端：DoH 端点都是固定几个域名，
+// 复用 TLS 连接后第二次起的解析免掉完整握手（80~300ms → ~30ms 级）。
+var dohClient = &http.Client{
+	Timeout: requestTimeout,
+	Transport: &http.Transport{
+		TLSClientConfig:     &tls.Config{MinVersion: tls.VersionTLS12},
+		MaxIdleConnsPerHost: 4,
+		IdleConnTimeout:     90 * time.Second,
+	},
 }
 
 // queryOne 向单个 DoH 端点发送 wire-format DNS 查询，返回解析到的 IP 列表。
@@ -43,13 +86,7 @@ func queryOne(ctx context.Context, endpoint, domain string) ([]net.IP, error) {
 	req.Header.Set("Content-Type", "application/dns-message")
 	req.Header.Set("Accept", "application/dns-message")
 
-	client := &http.Client{
-		Timeout: requestTimeout,
-		Transport: &http.Transport{
-			TLSClientConfig: &tls.Config{MinVersion: tls.VersionTLS12},
-		},
-	}
-	resp, err := client.Do(req)
+	resp, err := dohClient.Do(req)
 	if err != nil {
 		return nil, err
 	}
@@ -82,25 +119,62 @@ func queryOne(ctx context.Context, endpoint, domain string) ([]net.IP, error) {
 	return ips, nil
 }
 
-// ResolveWith 使用给定的端点列表依次尝试解析 domain，
-// 任一端点成功即返回；全部失败时返回最后一个错误。
+// ResolveWith 并发竞速解析 domain：所有端点同时发请求，
+// 谁先返回完整的 A 记录就用谁，其余立刻取消——
+// 绝不串行等死人的 5 秒超时（v1.0.4 之前的老毛病：
+// Cloudflare/Google 国内被墙，随机起点落在它们头上每个域名白等 5~10s）。
+//
+// 健康记忆：上次赢家下次先发（提前 raceStagger），其余端点错峰兜底；
+// 无记忆（首次/记忆被清除）时全部齐发。
 func ResolveWith(ctx context.Context, domain string, endpoints []string) ([]net.IP, error) {
 	if len(endpoints) == 0 {
 		endpoints = DefaultEndpoints
 	}
-	// 随机起点轮询端点，避免固定打到第一个。
-	start := rand.Intn(len(endpoints))
-	var lastErr error
-	for i := range endpoints {
-		ep := endpoints[(start+i)%len(endpoints)]
-		ips, err := queryOne(ctx, ep, domain)
-		if err == nil && len(ips) > 0 {
-			return ips, nil
+	good, _ := goodEndpoint.Load().(string)
+
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	type res struct {
+		ep  string
+		ips []net.IP
+		err error
+	}
+	ch := make(chan res, len(endpoints)) // 缓冲足够大，协程不会因发送阻塞而泄漏
+	for _, ep := range endpoints {
+		wait := time.Duration(0)
+		if good != "" && ep != good {
+			wait = raceStagger
 		}
-		if err != nil {
-			lastErr = err
+		go func(ep string, wait time.Duration) {
+			if wait > 0 {
+				select {
+				case <-time.After(wait):
+				case <-ctx.Done():
+					ch <- res{ep: ep, err: ctx.Err()}
+					return
+				}
+			}
+			ips, err := queryOne(ctx, ep, domain)
+			ch <- res{ep: ep, ips: ips, err: err}
+		}(ep, wait)
+	}
+
+	var lastErr error
+	for range endpoints {
+		r := <-ch
+		if r.err == nil && len(r.ips) > 0 {
+			cancel() // 赢家出现，其余请求立刻作废
+			noteGood(r.ep)
+			return r.ips, nil
+		}
+		if r.err != nil {
+			lastErr = r.err
+			if r.ep == good && ctx.Err() == nil {
+				noteGoodFail()
+			}
 		} else {
-			lastErr = fmt.Errorf("DoH 端点 %s 无应答记录", ep)
+			lastErr = fmt.Errorf("DoH 端点 %s 无应答记录", r.ep)
 		}
 	}
 	if lastErr == nil {

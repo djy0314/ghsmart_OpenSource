@@ -1,10 +1,10 @@
 doh_endpoints:
-  - https://cloudflare-dns.com/dns-query
-  - https://dns.google/dns-query
-  - https://dns.alidns.com/dns-query
+  - https://dns.alidns.com/dns-query   # 国内双保险（阿里）：国内用户的主解析路径
+  - https://doh.pub/dns-query          # 国内双保险（腾讯）：阿里不可达时的国内兜底
+  - https://cloudflare-dns.com/dns-query  # 海外用户；国内被墙时由并发竞速自然淘汰
+  - https://dns.google/dns-query          # 海外用户；同上
 domains:
   - github.com
-  - assets-cdn.github.com
   - github.global.ssl.fastly.net
   - raw.githubusercontent.com
   - objects.githubusercontent.com
