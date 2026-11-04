@@ -34,7 +34,10 @@ const (
 )
 
 // defaultStore 返回真实注册表实现。
-func defaultStore() Store { return registryStore{} }
+// defaultStoreFn 可被测试替换（app 层测 SetDeepAccel 时用内存桩隔离注册表）。
+var defaultStoreFn = func() Store { return registryStore{} }
+
+func defaultStore() Store { return defaultStoreFn() }
 
 type registryStore struct{}
 

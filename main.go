@@ -17,6 +17,9 @@ import (
 	"github.com/wailsapp/wails/v2/pkg/options/assetserver"
 	"github.com/wailsapp/wails/v2/pkg/options/windows"
 	wruntime "github.com/wailsapp/wails/v2/pkg/runtime"
+
+	"ghsmart/internal/jobobj"
+	"ghsmart/internal/proxyguard"
 )
 
 //go:embed all:frontend/dist
@@ -26,7 +29,22 @@ var assets embed.FS
 var trayIcon []byte
 
 func main() {
+	// 守卫进程分支：必须在任何 GUI/托盘初始化之前处理，
+	// 否则守卫会再开一个窗口、再派生一个守卫，无限递归。
+	if len(os.Args) > 1 && os.Args[1] == proxyguard.GuardArg {
+		os.Exit(proxyguard.Run(os.Args[2:]))
+	}
+
 	app := NewApp()
+
+	// 作业对象：主进程一死，作业内所有辅助进程被操作系统立刻终止，
+	// 不会留下占着端口的孤儿。守卫进程刻意不加入作业（它要活到最后收尾）。
+	// 这里不显式 Close：进程退出时系统统一回收句柄，避免与守卫的竞态。
+	if job, err := jobobj.New(); err == nil {
+		app.job = job
+	} else {
+		app.logf("作业对象创建失败（不影响代理与还原）: %v", err)
+	}
 
 	// 托盘在独立 goroutine 运行
 	go systray.Run(app.onTrayReady, func() {})

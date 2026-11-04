@@ -6,10 +6,6 @@ export function ActivatePro(arg1) {
   return window['go']['main']['App']['ActivatePro'](arg1);
 }
 
-export function CheckDeepPrecondition() {
-  return window['go']['main']['App']['CheckDeepPrecondition']();
-}
-
 export function ClearLicense() {
   return window['go']['main']['App']['ClearLicense']();
 }
@@ -34,10 +30,6 @@ export function QuitApp() {
   return window['go']['main']['App']['QuitApp']();
 }
 
-export function RefreshDeepPrecondition() {
-  return window['go']['main']['App']['RefreshDeepPrecondition']();
-}
-
 export function RemoveHosts() {
   return window['go']['main']['App']['RemoveHosts']();
 }
@@ -46,8 +38,8 @@ export function SetAutoHeal(arg1) {
   return window['go']['main']['App']['SetAutoHeal'](arg1);
 }
 
-export function SetDeepAccel(arg1, arg2, arg3, arg4) {
-  return window['go']['main']['App']['SetDeepAccel'](arg1, arg2, arg3, arg4);
+export function SetDeepAccel(arg1) {
+  return window['go']['main']['App']['SetDeepAccel'](arg1);
 }
 
 export function Shutdown() {

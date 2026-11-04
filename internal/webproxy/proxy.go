@@ -35,11 +35,9 @@ type Options struct {
 	// ResolveInvalidate 在「全部候选都拨不通」时回调，让上层作废该域名的缓存，
 	// 下次重新走 DoH，而不是拿同一批死 IP 反复撞。
 	ResolveInvalidate func(host string)
-	// DisableSplit 是「兼容模式」开关：开启后对任何域名都不做 TLS 分片，
-	// 只做基础的 HTTP CONNECT 隧道（流量形态与普通代理完全一致）。
-	// 场景：深信服 aTrust 等公司 VPN 的底层防火墙会把「分片的 TLS 握手」判为
-	// 异常流量并重置连接（浏览器表现 ERR_CONNECTION_CLOSED）。
-	// 注意它只关分片，**不改变拨号规则**：管辖域名依旧只按优选 IP 拨号。
+	// DisableSplit 让代理「一启动就用纯隧道」，不尝试 TLS 分片。
+	// 仅用于配置里显式指定的场景；正常运行时不做用户可见的开关，
+	// 而是在检测到拦截后自动降级（见 DegradeAfter / OnDegrade）。
 	DisableSplit bool
 	// LocalAddrs 是可选的本机源 IP 列表（物理网卡的 IPv4，由上层自动探测）。
 	// 拨号竞速时会为候选 IP 额外增加「绑定该源地址」的入口：
@@ -47,11 +45,14 @@ type Options struct {
 	// 从而绕开 aTrust 等虚拟网卡对默认路由的劫持。
 	// 绑定失败（IP 不是本机的等）由竞速机制自然淘汰，无任何副作用。
 	LocalAddrs []string
-	// OnAutoFallback 是「自动避让」回调：管辖域名的 CONNECT 连续
-	// autoFallbackThreshold 轮「全部候选 IP 失败 / 握手被拦」时触发一次，
-	// 参数是最后一条失败原因。上层应借此自动关闭深度加速（公司 VPN 场景下
-	// 继续开着只会让用户网页全卡死）。回调在独立协程里执行，可安全调用 Stop。
-	OnAutoFallback func(reason string)
+	// OnDegrade 是「静默降级」回调：连续 DegradeAfter 次分片握手失败
+	// （典型形态是公司防火墙/VPN 把分片 TLS 判成异常流量并重置），
+	// 代理会自动切成纯 CONNECT 隧道，并回调一次本函数。
+	// 调用方只需把状态显示成「已开启 · 智能降级」，**不要弹窗、不要关闭加速**。
+	// 回调在独立协程里执行，可安全调用 Stop。
+	OnDegrade func(reason string)
+	// DegradeAfter 是触发静默降级的连续失败次数，<=0 时用默认值 3。
+	DegradeAfter int
 	// Logf 是可选日志钩子（GUI 下写 ~/.ghsmart/ghsmart.log）。
 	Logf func(format string, args ...any)
 
@@ -70,6 +71,7 @@ type Stats struct {
 	Pass     int64  `json:"pass"`     // 累计未分片（非目标域名/非 ClientHello）
 	Retry    int64  `json:"retry"`    // 累计「握手无响应→换 IP/换节奏」重试次数
 	Plain    int64  `json:"plain"`    // 累计「分片全失败→不分片直发」救回次数
+	Degraded bool   `json:"degraded"` // 是否已静默降级为纯隧道
 	Addr     string `json:"addr"`     // 监听地址
 	LastHost string `json:"lastHost"` // 最近一次分片的域名（诊断用）
 }
@@ -97,11 +99,13 @@ type Server struct {
 	goodMu sync.Mutex
 	good   map[string]string
 
-	// 自动避让（Auto-Fallback）状态：
-	// failStreak 是连续「该域名全部候选都失败」的轮数，成功即清零；
-	// fallbackFired 保证回调只触发一次（触发后代理会被上层关掉）。
-	failStreak    atomic.Int32
-	fallbackFired atomic.Bool
+	// 静默降级（原「自动避让」）状态：
+	// failStreak 是连续「分片路径失败」的次数，一次成功即清零；
+	// degradeFired 保证降级与回调只发生一次；
+	// degraded 是生效开关，置位后 shouldSplit 一律返回 false（纯隧道）。
+	failStreak   atomic.Int32
+	degraded     atomic.Bool
+	degradeFired atomic.Bool
 }
 
 // 握手阶段的节奏参数：第一次用配置值，失败后逐步拉长间隔（DPI 越难重组）。
@@ -130,27 +134,48 @@ const handshakeBudget = 7 * time.Second
 // plainFallbackWait 是「分片全失败 → 退回不分片直发」那一次的等待时限。
 const plainFallbackWait = 3 * time.Second
 
-// autoFallbackThreshold 是触发「自动避让」的连续全败轮数：
-// 管辖域名连续 3 条 CONNECT 全部候选失败/握手被拦，基本可断定是
-// 网络环境（公司 VPN 等）在拦截加速流量，再开着只会让用户网页全卡死。
-const autoFallbackThreshold = 3
+// defaultDegradeAfter 是默认的静默降级阈值：连续 3 条分片握手失败，
+// 基本可以断定中间设备在拦分片 TLS（公司防火墙 / aTrust 等）。
+const defaultDegradeAfter = 3
 
-// noteUpstreamFail 记一次「管辖域名全部候选失败」，达到阈值时触发自动避让回调（仅一次）。
-func (s *Server) noteUpstreamFail(reason string) {
+// degradeThreshold 返回生效的降级阈值。
+func (s *Server) degradeThreshold() int32 {
+	if s.opts.DegradeAfter > 0 {
+		return int32(s.opts.DegradeAfter)
+	}
+	return defaultDegradeAfter
+}
+
+// noteFailure 记一次「分片路径失败」（拨号全挂或 TLS 握手被重置）。
+//
+// 达到阈值就静默降级：后续连接一律走纯 CONNECT 隧道，用户无需知道
+// 什么是分片、什么是兼容模式。降级只发生一次，回调也只触发一次。
+func (s *Server) noteFailure(reason string) {
+	if s.degraded.Load() {
+		return // 已经降级，隧道再怎么失败也不该反复折腾
+	}
 	n := s.failStreak.Add(1)
-	if n < autoFallbackThreshold {
+	if n < s.degradeThreshold() {
 		return
 	}
-	if s.opts.OnAutoFallback == nil || !s.fallbackFired.CompareAndSwap(false, true) {
+	if !s.degradeFired.CompareAndSwap(false, true) {
 		return
 	}
-	s.logf("自动避让触发：连续 %d 轮全部候选失败，通知上层关闭深度加速（最后原因: %v）", n, reason)
-	go s.opts.OnAutoFallback(reason)
+	s.degraded.Store(true)
+	s.logf("静默降级：连续 %d 次分片握手失败，切换为纯 CONNECT 隧道（最后原因: %v）", n, reason)
+	if s.opts.OnDegrade != nil {
+		go s.opts.OnDegrade(reason)
+	}
 }
 
 // noteUpstreamOK 连接成功（建连且开始服务），清零连败计数。
 func (s *Server) noteUpstreamOK() {
 	s.failStreak.Store(0)
+}
+
+// Degraded 报告代理是否已降级为纯隧道模式（UI 状态栏用）。
+func (s *Server) Degraded() bool {
+	return s.degraded.Load()
 }
 
 // VPN 兼容竞速的参数：只为前几个候选 IP 增加绑定源地址的入口，
@@ -380,11 +405,17 @@ func New(opts Options) *Server {
 		// 否则「系统代理指向本机」时会形成自我递归。
 		opts.Dial = d.DialContext
 	}
-	return &Server{
+	srv := &Server{
 		opts:  opts,
 		conns: make(map[net.Conn]struct{}),
 		good:  make(map[string]string),
 	}
+	if opts.DisableSplit {
+		// 配置显式要求「一启动就纯隧道」时，状态也要如实反映为已降级
+		srv.degraded.Store(true)
+		srv.degradeFired.Store(true)
+	}
+	return srv
 }
 
 // Start 开始监听；返回实际监听地址（Listen 端口为 0 时可用于单测）。
@@ -433,7 +464,13 @@ func (s *Server) DropConns() {
 	}
 }
 
-// Stop 关闭监听并断开所有在途隧道（关闭深度加速时要立刻放行直连）。
+// Stop 关闭监听并**暴力断开**所有在途隧道（关闭深度加速时要立刻放行直连）。
+//
+// 这里刻意**不** s.wg.Wait()：正在拨号的请求要等到 DialTimeout（默认秒级）
+// 才肯退出，在 Stop 里等它等于让用户点「关闭」后卡好几秒。
+// 客户端连接一关，serve 里的 io.Copy 立刻返回；还没连上的拨号会在自身超时后
+// 退出，不占资源也不影响已经放行的直连流量。
+// 需要「彻底等干净」的场景（进程退出）不必等——进程一走协程自然消失。
 func (s *Server) Stop() error {
 	s.mu.Lock()
 	if s.done {
@@ -453,10 +490,15 @@ func (s *Server) Stop() error {
 	if ln != nil {
 		err = ln.Close()
 	}
+	// 直接 Close 句柄（不等 FIN/半关闭），在途隧道立即断
 	for _, c := range conns {
 		_ = c.Close()
 	}
-	s.wg.Wait()
+	// 收尾放到后台，只做日志，绝不阻塞调用方
+	go func() {
+		s.wg.Wait()
+		s.logf("代理已完全停止（监听已释放，所有活跃连接已切断）")
+	}()
 	return err
 }
 
@@ -470,6 +512,7 @@ func (s *Server) Stats() Stats {
 		Pass:     s.nPass.Load(),
 		Retry:    s.nRetry.Load(),
 		Plain:    s.nPlain.Load(),
+		Degraded: s.degraded.Load(),
 		Addr:     s.Addr(),
 		LastHost: host,
 	}
@@ -558,10 +601,8 @@ func (s *Server) handleConnect(c net.Conn, br *bufio.Reader, req *http.Request) 
 		reason := fmt.Sprintf("无法连接到 %s：%v", target, err)
 		// 502 的日志要把「试过哪些 IP、各自为什么失败」写清楚，否则线上没法定位
 		s.logf("CONNECT %s 返回 502（未回 200 阶段）: %v", target, err)
-		// 自动避让：只统计管辖域名（GitHub 系）的全败；普通网站失败不代表加速链路被拦
-		if managed {
-			s.noteUpstreamFail(err.Error())
-		}
+		// 这里刻意不触发降级：拨号失败是「IP 不可达」，跟分不分片无关，
+		// 降级成隧道也照样连不上。降级只认「握手被重置」这一种形态。
 		s.writeErr(c, http.StatusBadGateway, reason)
 		return
 	}
@@ -603,7 +644,7 @@ func (s *Server) handleConnect(c net.Conn, br *bufio.Reader, req *http.Request) 
 		s.logf("CONNECT %s TLS 握手彻底失败（分片 %d 次尝试 + 直发回退均失败）: %v",
 			target, maxHandshakeAttempts, herr)
 		// 握手阶段彻底失败同样计入自动避让：VPN 场景下正是「连上了但被 RST」的形态
-		s.noteUpstreamFail(herr.Error())
+		s.noteFailure(herr.Error())
 		s.abortTLS(c, br, herr)
 		return
 	}
@@ -1050,7 +1091,7 @@ func (s *Server) shouldSplit(host string) bool {
 	if host == "" {
 		return false
 	}
-	if s.opts.DisableSplit {
+	if s.opts.DisableSplit || s.degraded.Load() {
 		return false
 	}
 	if len(s.opts.Hosts) == 0 {

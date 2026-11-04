@@ -301,3 +301,24 @@ func TestDisableIfOwned(t *testing.T) {
 		t.Fatalf("已关闭的代理应 no-op（ok=%v err=%v）", ok3, err)
 	}
 }
+
+// TestDisableForce：「🩺 网络急救」用的无条件关闭——不看归属、不查备份，
+// 但代理本来就没开时绝不写注册表。
+func TestDisableForce(t *testing.T) {
+	// 情形一：第三方代理开着也能被强制关闭（急救场景用户显式要求直连）
+	st := &memStore{v: Values{Enable: 1, Server: "127.0.0.1:7890", Override: "*.cn", HasOverride: true}}
+	ok, err := disableWith(st)
+	if err != nil {
+		t.Fatalf("disable 失败: %v", err)
+	}
+	if !ok || st.v.Enable != 0 {
+		t.Fatalf("强制关闭失败: ok=%v v=%+v", ok, st.v)
+	}
+
+	// 情形二：本来就没开 → no-op
+	st2 := &memStore{v: Values{Enable: 0}}
+	ok2, err := disableWith(st2)
+	if err != nil || ok2 {
+		t.Fatalf("已关闭应 no-op（ok=%v err=%v）", ok2, err)
+	}
+}

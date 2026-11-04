@@ -36,6 +36,14 @@ type Store interface {
 	Write(Values) error
 }
 
+// SetStoreForTest 仅供单元测试替换注册表存储，返回恢复函数。
+// 生产代码绝不调用——系统代理的读写只有注册表这一个真实来源。
+func SetStoreForTest(st Store) (restore func()) {
+	old := defaultStoreFn
+	defaultStoreFn = func() Store { return st }
+	return func() { defaultStoreFn = old }
+}
+
 // BackupPath 返回备份文件路径（默认 ~/.ghsmart/sysproxy.bak.json）。
 // 环境变量 GHSMART_SYSPROXY_FILE 可覆盖（单测隔离用）。
 func BackupPath() string {
@@ -89,6 +97,28 @@ func IsOn(target string) bool {
 		return false
 	}
 	return ownedBy(v, target)
+}
+
+// Disable 无条件关闭系统代理（ProxyEnable=0），不查备份、不看归属。
+//
+// 仅供「🩺 网络急救」这类用户显式要求恢复直连的场景使用：常规流程请一律用
+// Restore（精准还原）或 DisableIfOwned（只关自己的），避免误杀第三方代理。
+func Disable() (bool, error) {
+	return disableWith(defaultStore())
+}
+
+func disableWith(st Store) (bool, error) {
+	cur, err := st.Read()
+	if err != nil {
+		return false, fmt.Errorf("读取系统代理失败: %w", err)
+	}
+	if cur.Enable != 1 {
+		return false, nil // 本来就没开，不写注册表
+	}
+	if err := st.Write(Values{Enable: 0}); err != nil {
+		return false, fmt.Errorf("关闭系统代理失败: %w", err)
+	}
+	return true, nil
 }
 
 // DisableIfOwned 在系统代理仍指向 target 时强制关闭（ProxyEnable=0，不查备份）。

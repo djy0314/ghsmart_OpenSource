@@ -1,11 +1,9 @@
 package main
 
 import (
-	"os"
 	"path/filepath"
 	"testing"
 
-	"ghsmart/internal/config"
 )
 
 // TestAutoHealToggle：自愈开关必须能真正开、真正关，状态与返回值严格一致。
@@ -115,7 +113,7 @@ func TestDeepAccelGating(t *testing.T) {
 	t.Setenv("GHSMART_SYSPROXY_FILE", filepath.Join(t.TempDir(), "sysproxy.bak.json"))
 
 	a := NewApp()
-	if _, err := a.SetDeepAccel(true, DeepModeAuto, false, false); err == nil {
+	if _, err := a.SetDeepAccel(true); err == nil {
 		t.Fatal("Free 版应拒绝开启深度加速")
 	}
 	if a.GetProState()["deepAccel"].(bool) {
@@ -127,7 +125,7 @@ func TestDeepAccelGating(t *testing.T) {
 
 	// 未开启状态下关闭：安全空操作
 	a.pro.Store(true)
-	st, err := a.SetDeepAccel(false, "", false, false)
+	st, err := a.SetDeepAccel(false)
 	if err != nil {
 		t.Fatalf("关闭失败: %v", err)
 	}
@@ -136,36 +134,3 @@ func TestDeepAccelGating(t *testing.T) {
 	}
 }
 
-// 手动模式：只开本地端口，**绝不能写系统代理备份/注册表**。
-func TestDeepAccelManualModeTouchesNoRegistry(t *testing.T) {
-	licFile := filepath.Join(t.TempDir(), "license.json")
-	bakFile := filepath.Join(t.TempDir(), "sysproxy.bak.json")
-	t.Setenv("GHSMART_LICENSE_FILE", licFile)
-	t.Setenv("GHSMART_SYSPROXY_FILE", bakFile)
-
-	a := NewApp()
-	a.pro.Store(true)
-	// 用随机端口，避免和真机正在跑的 18080 抢
-	cfg := &config.Config{WebProxy: config.WebProxy{
-		Listen:     "127.0.0.1:0",
-		SplitHosts: []string{"github.com"},
-	}}
-	if err := a.startDeep(cfg, DeepModeManual, false); err != nil {
-		t.Fatalf("手动模式启动失败: %v", err)
-	}
-	st := a.GetProState()
-	if !st["deepAccel"].(bool) || st["deepMode"].(string) != DeepModeManual {
-		t.Fatalf("手动模式状态不对: %v", st)
-	}
-	if st["deepListen"].(string) == "" {
-		t.Fatal("手动模式应显示监听地址")
-	}
-	if _, err := os.Stat(bakFile); !os.IsNotExist(err) {
-		t.Fatal("手动模式绝不能创建系统代理备份（说明动了注册表）")
-	}
-
-	a.stopDeep()
-	if a.GetProState()["deepAccel"].(bool) {
-		t.Fatal("关闭后 deepAccel 应为 false")
-	}
-}

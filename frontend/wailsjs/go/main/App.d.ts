@@ -3,8 +3,6 @@
 
 export function ActivatePro(arg1:string):Promise<void>;
 
-export function CheckDeepPrecondition():Promise<Record<string, any>>;
-
 export function ClearLicense():Promise<void>;
 
 export function GetAppliedEntries():Promise<Record<string, string>>;
@@ -17,13 +15,11 @@ export function IsElevated():Promise<boolean>;
 
 export function QuitApp():Promise<void>;
 
-export function RefreshDeepPrecondition():Promise<Record<string, any>>;
-
 export function RemoveHosts():Promise<void>;
 
 export function SetAutoHeal(arg1:boolean):Promise<Record<string, any>>;
 
-export function SetDeepAccel(arg1:boolean,arg2:string,arg3:boolean,arg4:boolean):Promise<Record<string, any>>;
+export function SetDeepAccel(arg1:boolean):Promise<Record<string, any>>;
 
 export function Shutdown():Promise<void>;
 

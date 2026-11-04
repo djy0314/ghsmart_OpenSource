@@ -28,12 +28,14 @@ func TestLiveDeepAccelCurl(t *testing.T) {
 		}
 	}()
 
+	restore := sysproxy.SetStoreForTest(&memValues{})
+	defer restore()
 	a := NewApp()
 	a.pro.Store(true)
 	cfg := a.loadCfg()
 	cfg.WebProxy.Listen = "127.0.0.1:0" // 随机端口，别和真机 18080 抢
 	cfg.WebProxy.SplitDelayMS = 10
-	if err := a.startDeep(cfg, DeepModeManual, false); err != nil {
+	if err := a.startDeep(cfg); err != nil {
 		t.Fatalf("启动代理失败: %v", err)
 	}
 	defer a.Shutdown()
@@ -90,12 +92,14 @@ func TestLiveDeepWithStaleHostsIP(t *testing.T) {
 	logFile := filepath.Join(t.TempDir(), "ghsmart.log")
 	t.Setenv("GHSMART_LOG_FILE", logFile)
 
+	restore := sysproxy.SetStoreForTest(&memValues{})
+	defer restore()
 	a := NewApp()
 	a.pro.Store(true)
 	cfg := a.loadCfg()
 	cfg.WebProxy.Listen = "127.0.0.1:0"
 	cfg.WebProxy.SplitDelayMS = 10
-	if err := a.startDeep(cfg, DeepModeManual, false); err != nil {
+	if err := a.startDeep(cfg); err != nil {
 		t.Fatalf("启动代理失败: %v", err)
 	}
 	defer a.Shutdown()
@@ -134,44 +138,5 @@ func TestLiveDeepWithStaleHostsIP(t *testing.T) {
 
 	if data, err := os.ReadFile(logFile); err == nil {
 		t.Logf("代理日志:\n%s", data)
-	}
-}
-
-// TestLivePrecheckRealNetwork 是号主报障的实网回归：
-// 先造一份「VPN 期间 github.com 全失败」的旧报告，再走真实网络的实时微测——
-// 只要此刻能连上 github.com，预检必须放行，且旧报告必须被清空。
-//
-//	go test -tags live . -run TestLivePrecheckRealNetwork -v
-func TestLivePrecheckRealNetwork(t *testing.T) {
-	probeFile := filepath.Join(t.TempDir(), "lastprobe.json")
-	t.Setenv("GHSMART_PROBE_FILE", probeFile)
-	t.Setenv("GHSMART_CACHE_FILE", filepath.Join(t.TempDir(), "cache.json"))
-
-	if err := cache.SaveProbeReport(map[string][]cache.ProbeRecord{
-		"github.com": {{IP: "20.205.243.166", OK: false, Err: "TCP 失败: i/o timeout"}},
-	}); err != nil {
-		t.Fatalf("写入旧失败报告失败: %v", err)
-	}
-
-	// 先自证本机此刻确实能连上：连不上就跳过，绝不把「真断网」误判成代码失败
-	cfg := NewApp().loadCfg()
-	if res := NewApp().deepLiveCheck(cfg, "github.com"); !res.OK {
-		t.Skipf("当前网络确实连不上 github.com（候选 %d 个），跳过实时预检验收", res.Checked)
-	}
-	t.Log("自证通过：本机此刻可连 github.com")
-
-	a := NewApp()
-	start := time.Now()
-	pc := a.CheckDeepPrecondition()
-	t.Logf("预检耗时 %v，结果 %+v", time.Since(start), pc)
-
-	if pc["ok"] != true {
-		t.Fatalf("网络可通却被预检拦截（号主报障复现）: %+v", pc)
-	}
-	if pc["live"] != true {
-		t.Fatalf("预检必须走实时微测: %+v", pc)
-	}
-	if _, err := os.Stat(probeFile); !os.IsNotExist(err) {
-		t.Fatalf("放行后旧报告必须被清空（statErr=%v）", err)
 	}
 }

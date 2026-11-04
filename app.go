@@ -4,7 +4,6 @@ package main
 
 import (
 	"context"
-	"crypto/tls"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -25,8 +24,10 @@ import (
 	"ghsmart/internal/doh"
 	"ghsmart/internal/engine"
 	"ghsmart/internal/executor"
+	"ghsmart/internal/jobobj"
 	"ghsmart/internal/license"
 	"ghsmart/internal/probe"
+	"ghsmart/internal/proxyguard"
 	"ghsmart/internal/sysproxy"
 	"ghsmart/internal/webproxy"
 )
@@ -44,12 +45,21 @@ type App struct {
 	healOn     atomic.Bool
 	// 深度网页加速（本地 TLS 分片代理 + 系统代理接管）。
 	// deepOn 是唯一对外状态源；proxy/deepAddr/deepMode/deepCompat 由 deepMu 保护。
-	deepMu     sync.Mutex
-	proxy      *webproxy.Server
-	deepAddr   string
-	deepMode   string
-	deepCompat bool // 兼容模式：不做 TLS 分片（公司 VPN 场景）
-	deepOn     atomic.Bool
+	deepMu       sync.Mutex
+	proxy        *webproxy.Server
+	deepAddr     string
+	deepMode     string
+	deepCompat   bool // 保留字段：老配置兼容用，新流程不再有兼容模式
+	deepDegraded bool // 代理层已静默降级为纯隧道（状态栏显示「智能降级」）
+	deepOn       atomic.Bool
+	// deepGen 是「接管代际」：每次成功开启 +1。关闭时后台还原系统代理前先比对
+	// 它——期间用户若又点开了（代际变了），这次旧还原必须放弃，否则会把刚接管好
+	// 的系统代理又写回直连，用户看到的就是「开了跟没开一样」。
+	deepGen atomic.Int64
+	// restoreMu 把「写系统代理」这一小段临界区串行化（接管 vs 还原）。
+	// 只锁注册表读写，绝不覆盖启动/停止代理、也不覆盖 UI 返回路径——
+	// 所以关闭时用户感觉不到它，开启时最多等一下正在跑的还原。
+	restoreMu sync.Mutex
 	// bypassRemoved 记录本次接管从系统「代理例外列表」里剔除了哪些 GitHub 条目，
 	// 供前端回显（用户可据此去 Windows 代理设置里核对）。
 	bypassRemoved []string
@@ -58,14 +68,11 @@ type App struct {
 	ipMu    sync.Mutex
 	ipCache map[string]ipEntry
 
-	// 看门狗：休眠唤醒恢复 + 代理失效捕捉 + 自愈卡死复位。
-	// wdCancel 停止看门狗；deadStreak 是代理连续无响应计数（防瞬时抖动误报）；
-	// healBusySince/healLastDone 记录自愈循环的繁忙起点（unix 秒，0=空闲），
-	// 用于发现「自愈卡死后 busy 永远为 true」的僵局。
-	wdMu      sync.Mutex
-	wdCancel  context.CancelFunc
-	deadStreak atomic.Int32
-	healBusySince atomic.Int64
+	// 作业对象 + 守卫进程：保证「主进程被强杀」时系统代理也会被还原。
+	// job 由 main 创建并注入；guard 在第一次开启深度加速时懒派生（免费用户不占进程）。
+	job       *jobobj.Job
+	guardOnce sync.Once
+	guard     *proxyguard.Guard
 
 	// 诊断日志（GUI 无控制台，写 ~/.ghsmart/ghsmart.log）
 	logMu   sync.Mutex
@@ -101,116 +108,20 @@ func (a *App) startup(ctx context.Context) {
 				a.startHeal(cfg)
 			}
 			if st.DeepAccel {
-				if err := a.startDeep(cfg, st.DeepMode, a.effectiveCompat(st, cfg)); err != nil {
+				// 重启后恢复上次状态：不再问模式、不问兼容，
+				// 一律按「智能模式」启动（分片→失败自动降级）
+				if err := a.startDeep(cfg); err != nil {
 					a.emitStatus("深度加速恢复失败: "+err.Error(), "warn")
 				}
 			}
 		}
 	}
-	// 兼容模式默认值：license.json 里用户勾选过的优先，否则取配置文件开关
-	a.deepMu.Lock()
-	a.deepCompat = a.effectiveCompat(a.loadLicenseState(), cfg)
-	a.deepMu.Unlock()
 	// ★ 缓存秒应用：上次探测成功的最优 IP 直接恢复加速（免费版无条件），
 	// 打开软件即用，无需再点按钮；随后后台静默校验更优 IP。
 	a.applyCacheOnStartup(cfg)
-	// ★ 看门狗：休眠唤醒恢复 + 代理失效捕捉 + 自愈卡死复位（免费/通用，开销极小）
-	a.startWatchdog()
 	a.emitState()
 }
 
-// ---------- 看门狗：休眠唤醒 / 代理失效 / 自愈卡死 ----------
-
-// wdInterval 是看门狗的巡检间隔。声明成变量是为了测试能缩短它。
-var wdInterval = 5 * time.Second
-
-// wdWakeGap 是「判定发生了休眠唤醒」的心跳缺口阈值：一次正常巡检间隔的
-// 4 倍以上没跳（系统挂起导致定时器被冻结）就视为刚从睡眠/休眠中唤醒。
-var wdWakeGap = 4 * 5 * time.Second
-
-// wdDeadStreakLimit 是深度代理连续无响应多少次才判定失效（防瞬时抖动误报）。
-var wdDeadStreakLimit int32 = 2
-
-// healStallTimeout 是自愈循环繁忙多久判定为卡死。
-var healStallTimeout = 15 * time.Minute
-
-// deepAliveProbe 是代理端口探活实现（测试可替换）：TCP 能连上即视为活着。
-var deepAliveProbe = func(addr string, timeout time.Duration) bool {
-	c, err := net.DialTimeout("tcp", addr, timeout)
-	if err != nil {
-		return false
-	}
-	_ = c.Close()
-	return true
-}
-
-// zombieIsOn / zombieDisable / zombiePortAlive 是僵尸代理清理的系统触点
-//（测试可替换，绝不碰真实注册表）。
-var zombieIsOn = sysproxy.IsOn
-var zombieDisable = sysproxy.DisableIfOwned
-
-// startWatchdog 启动看门狗循环（幂等：重复调用先停旧的）。
-// 管三件事：① 休眠唤醒后的资源重置；② 深度代理失效的捕捉与自动恢复；
-// ③ 自愈循环卡死时的强制复位。Free/Pro 都跑，开销一次 TCP 探活以内。
-func (a *App) startWatchdog() {
-	ctx, cancel := context.WithCancel(context.Background())
-	a.wdMu.Lock()
-	if a.wdCancel != nil {
-		a.wdCancel() // 停旧循环
-	}
-	a.wdCancel = cancel
-	a.wdMu.Unlock()
-
-	go func() {
-		last := time.Now()
-		ticker := time.NewTicker(wdInterval)
-		defer ticker.Stop()
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case now := <-ticker.C:
-				if gap := now.Sub(last); gap > wdWakeGap {
-					a.onWake(gap)
-				}
-				last = now
-				a.checkDeepAlive()
-				a.checkHealStall()
-			}
-		}
-	}()
-}
-
-// stopWatchdog 停止看门狗循环（退出时调用，幂等）。
-func (a *App) stopWatchdog() {
-	a.wdMu.Lock()
-	defer a.wdMu.Unlock()
-	if a.wdCancel != nil {
-		a.wdCancel()
-		a.wdCancel = nil
-	}
-}
-
-// onWake 在系统从休眠/睡眠唤醒后被调用：休眠前的 TCP 连接、DNS/优选缓存
-// 全部不可信，必须重置；代理端口若已死，走统一的失效恢复路径。
-func (a *App) onWake(gap time.Duration) {
-	a.logf("看门狗：检测到系统唤醒（心跳缺口 %v），重置网络资源", gap.Round(time.Second))
-	// 1. 优选 IP 解析缓存作废：休眠前解析的 IP 在新网络环境里可能全失效
-	a.ipMu.Lock()
-	a.ipCache = make(map[string]ipEntry)
-	a.ipMu.Unlock()
-	// 2. 深度代理的在途连接全部断开（保持监听），浏览器重连即走新路由
-	a.deepMu.Lock()
-	p := a.proxy
-	a.deepMu.Unlock()
-	if p != nil {
-		p.DropConns()
-	}
-	// 3. 代理端口活性立即复核（不等下一轮巡检）
-	a.checkDeepAlive()
-}
-
-// deepListenAddr 返回深度代理当前监听地址（未启动为空）。
 func (a *App) deepListenAddr() string {
 	a.deepMu.Lock()
 	defer a.deepMu.Unlock()
@@ -218,71 +129,6 @@ func (a *App) deepListenAddr() string {
 		return ""
 	}
 	return a.proxy.Addr()
-}
-
-// checkDeepAlive 是代理失效的捕捉与恢复：deepOn 为真时探活监听端口，
-// 连续 wdDeadStreakLimit 次连不上 → 判定失效 → 用同样的模式自动重启一次；
-// 重启也失败才广播 UI（「代理已失效，请重新开启」），绝不静默卡死。
-func (a *App) checkDeepAlive() {
-	if !a.deepOn.Load() {
-		a.deadStreak.Store(0)
-		return
-	}
-	addr := a.deepListenAddr()
-	if addr == "" || !deepAliveProbe(addr, 900*time.Millisecond) {
-		if a.deadStreak.Add(1) < wdDeadStreakLimit {
-			return // 偶发一次连不上可能只是瞬时抖动，再观察一轮
-		}
-	} else {
-		a.deadStreak.Store(0)
-		return
-	}
-	a.deadStreak.Store(0)
-	mode := a.deepMode
-	compat := a.deepCompat
-	a.logf("看门狗：深度代理 %s 连续无响应，判定失效，尝试自动恢复（mode=%s compat=%v）", addr, mode, compat)
-	cfg := deepRecoverCfg(a)
-	a.stopDeep()
-	if err := a.startDeep(cfg, mode, compat); err != nil {
-		a.logf("看门狗：代理自动恢复失败: %v", err)
-		a.emitStatus("代理已失效，请重新开启深度加速", "err")
-		emitProxyDead(a, addr, err.Error())
-		return
-	}
-	a.logf("看门狗：深度代理已自动恢复（新地址 %s）", a.deepListenAddr())
-	a.emitStatus("检测到代理失去响应，已自动恢复深度加速", "warn")
-}
-
-// deepRecoverCfg 是看门狗恢复代理时的配置来源（测试可替换）。
-var deepRecoverCfg = func(a *App) *config.Config { return a.loadCfg() }
-
-// emitProxyDead 向前端广播「代理已失效」事件（测试可替换）。
-var emitProxyDead = func(a *App, addr, errMsg string) {
-	if a.ctx == nil {
-		return
-	}
-	runtime.EventsEmit(a.ctx, "deep:proxydead", map[string]any{
-		"addr": addr, "error": errMsg,
-	})
-}
-
-// checkHealStall 在自愈循环「busy 置位后长时间不归还」时强制复位，
-// 防止一次卡死的探测把整个自愈循环变成永远跳过本轮的僵尸。
-func (a *App) checkHealStall() {
-	if !a.healOn.Load() || !a.busy.Load() {
-		return
-	}
-	since := a.healBusySince.Load()
-	if since == 0 {
-		return
-	}
-	if time.Since(time.Unix(since, 0)) < healStallTimeout {
-		return
-	}
-	a.healBusySince.Store(0)
-	a.busy.Store(false) // 复位：下一轮自愈不再被永久跳过
-	a.logf("看门狗：后台自愈繁忙超过 %v，疑似卡死，已强制复位", healStallTimeout)
-	a.emitStatus("后台自愈疑似卡死，已强制复位（不影响深度加速）", "warn")
 }
 
 // ---------- 僵尸代理清理（启动自检） ----------
@@ -293,6 +139,13 @@ func (a *App) checkHealStall() {
 // 直接强制关闭系统代理（ProxyEnable=0），绝不让用户一开机就全网断连。
 //
 // 与 Recover（按备份精准还原）互补：备份丢了/没写成时，这道闸保证兜底。
+//
+// 注入点：单测替换这两个变量即可，绝不碰真实注册表。
+var (
+	zombieIsOn    = sysproxy.IsOn
+	zombieDisable = sysproxy.DisableIfOwned
+)
+
 func (a *App) cleanZombieProxy(listen string) {
 	target := listen
 	if target == "" {
@@ -591,7 +444,8 @@ func (a *App) RemoveHosts() error {
 		return errors.New("应用尚未就绪")
 	}
 	// 1) 关闭深度加速：精准还原系统代理（只在我们接管时还原；Clash 等第三方代理不动）
-	a.stopDeep()
+	// 用户点的是「一键还原网络」，语义就是「现在就干净」，所以这里等它做完。
+	a.stopDeepWait(5 * time.Second)
 	// 2) 停掉自愈，否则刚还原完又被后台巡检写回去
 	a.stopHeal()
 	if st := a.loadLicenseState(); st.AutoHeal || st.DeepAccel {
@@ -705,9 +559,10 @@ func (a *App) QuitApp() {
 // Shutdown 退出前的清场：还原系统代理（最关键，否则用户会断网）并停掉自愈循环。
 // 由 Wails 的 OnShutdown 与托盘退出共同调用，可重复执行（幂等）。
 func (a *App) Shutdown() {
-	a.stopDeep()
+	// 退出场景不能用纯异步：进程一走，未完成的还原就没了（只剩守卫进程兜底）。
+	// 这里最多等 exitCleanupTimeout，超时也不阻塞退出。
+	a.stopDeepWait(exitCleanupTimeout)
 	a.stopHeal()
-	a.stopWatchdog()
 	a.closeLog()
 }
 
@@ -810,7 +665,7 @@ func (a *App) GetMachineCode() (string, error) {
 // ClearLicense 清除本地授权：还原系统代理、关闭自愈循环、删除 license.json、回到 Free。
 // 前端状态由 emitState 统一刷新。
 func (a *App) ClearLicense() error {
-	a.stopDeep() // 先退 Pro 功能，尤其是别把系统代理留在本机
+	a.stopDeepWait(exitCleanupTimeout) // 先退 Pro 功能，尤其是别把系统代理留在本机
 	a.stopHeal()
 	a.pro.Store(false)
 	p, err := licensePath()
@@ -841,10 +696,8 @@ func (a *App) proState() map[string]any {
 	if a.deepMode != "" {
 		m["deepMode"] = a.deepMode
 	}
-	m["deepCompat"] = a.deepCompat
-	// 弹窗默认勾选来源：配置文件 web_proxy.compat_mode（号主要求：默认不勾，
-	// 只有配置文件明确设了默认开启才勾；不再沿用「上次的选择」）
-	m["deepCompatDefault"] = a.loadCfg().WebProxy.CompatMode
+	// deepDegraded 是「已开启 · 智能降级」的唯一依据：分片被拦后代理自己切了隧道。
+	m["deepDegraded"] = a.deepDegraded
 	if a.proxy != nil {
 		m["deepListen"] = a.proxy.Addr()
 		m["deepStats"] = a.proxy.Stats()
@@ -903,11 +756,9 @@ func (a *App) startHeal(cfg *config.Config) {
 				if !a.busy.CompareAndSwap(false, true) {
 					continue // 上一轮还没跑完，跳过本周期
 				}
-				a.healBusySince.Store(time.Now().Unix()) // 看门狗据此发现卡死
 				a.emitStatus("后台自愈: 正在巡检...", "busy")
 				_, _, _, err := engine.ApplyOnce(cfg, guiReporter{a})
 				a.busy.Store(false)
-				a.healBusySince.Store(0)
 				if err != nil {
 					a.emitStatus("后台自愈: "+err.Error(), "err")
 					continue
@@ -947,32 +798,20 @@ func normalizeDeepMode(mode string) string {
 
 // SetDeepAccel 开关「深度网页加速」（仅 Pro 可用）。
 //
-//	on=true, mode=auto   → 启动本地 TLS 分片代理 + 接管系统代理（写注册表 + WinINET 广播）
-//	on=true, mode=manual → 只启动本地代理端口，绝对不碰注册表
-//	on=false             → 精准还原系统代理后关闭端口
-//	compat=true          → 兼容模式：不做 TLS 分片，纯 CONNECT 隧道（公司 VPN 场景）
-//	force=true           → 跳过实时微测预检（用户点「仍然强制开启」的逃生通道）
+// 2026-11-04 号主重构：不再有模式选择、不再有预检拦截。
+// 点开关就是开，连不上是网络的问题，不是软件拦人的理由。
 //
-// 返回操作后的真实状态，前端必须用返回值渲染。
-func (a *App) SetDeepAccel(on bool, mode string, compat bool, force bool) (map[string]any, error) {
+//	on=true  → 启动本地代理（默认 TLS 分片），auto 模式接管系统代理
+//	on=false → 精准还原系统代理后关闭端口
+//
+// 「连不上」由代理层自己解决：连续握手被重置会自动降级成纯隧道，
+// 界面只显示「已开启 · 智能降级」，不弹任何红色错误。
+func (a *App) SetDeepAccel(on bool) (map[string]any, error) {
 	if !a.pro.Load() {
 		return a.proState(), errors.New("深度网页加速是 Pro 功能，请先解锁")
 	}
-	mode = normalizeDeepMode(mode)
 	if on {
-		// 预检闸（后端为准，前端拦截只是体验优化）：现场做 2 秒实时微测，
-		// 只要此刻能连上 github.com 就放行——绝不拿旧报告拦人。
-		// force=true 是用户点了「仍然强制开启」的逃生通道：跳过微测，
-		// 但照样记录在案（日志可查、后果自负）。
-		if !force {
-			if ok, reason, checked, _ := a.deepPrecheckLive(a.primaryDomain()); !ok {
-				a.logf("深度加速被预检拦截（实时微测 %d 个候选全部不可达）", checked)
-				return a.proState(), errors.New(reason)
-			}
-		} else {
-			a.logf("深度加速被用户强制开启（跳过实时微测预检）")
-		}
-		if err := a.startDeep(a.loadCfg(), mode, compat); err != nil {
+		if err := a.startDeep(a.loadCfg()); err != nil {
 			return a.proState(), err
 		}
 	} else {
@@ -980,23 +819,10 @@ func (a *App) SetDeepAccel(on bool, mode string, compat bool, force bool) (map[s
 	}
 	st := a.loadLicenseState()
 	st.DeepAccel = a.deepOn.Load()
-	if st.DeepAccel {
-		st.DeepMode = mode
-		st.DeepCompat = compat
-	}
 	if err := a.saveLicenseState(st); err != nil {
 		return a.proState(), fmt.Errorf("深度加速已按预期切换，但保存状态失败: %w", err)
 	}
 	return a.proState(), nil
-}
-
-// effectiveCompat 计算兼容模式的生效值：用户在 UI 里明确勾选过的（license.json）
-// 优先；从未记录过时用配置文件 web_proxy.compat_mode 作为默认。
-func (a *App) effectiveCompat(st licenseState, cfg *config.Config) bool {
-	if st.DeepCompat {
-		return true
-	}
-	return cfg.WebProxy.CompatMode
 }
 
 // vpnNicKeywords 是虚拟/VPN 网卡的识别关键字（深信服 aTrust/EasyConnect、
@@ -1057,12 +883,15 @@ func physicalNICIPs() []string {
 	return out
 }
 
-// startDeep 拉起本地代理；auto 模式再接管系统代理。
-// compat=true 为兼容模式：不做 TLS 分片（公司 VPN 场景），其余规则不变。
-// 任何一步失败都会回滚，绝不留「端口开着但系统代理没接管」或反过来的中间态。
-func (a *App) startDeep(cfg *config.Config, mode string, compat bool) error {
-	mode = normalizeDeepMode(mode)
-
+// startDeep 拉起本地代理并接管系统代理。
+//
+// 2026-11-04 号主重构：没有模式参数、没有兼容开关——一律「智能模式」：
+//   - 启动即用 TLS 分片（对抗 SNI 阻断）
+//   - 连续握手被重置 → 代理层自己降级为纯 CONNECT 隧道并回调 onDeepDegrade
+//
+// 用户只需要知道「开了」还是「没开」，剩下的全部交给底层。
+// 任何一步失败都会回滚，绝不留「端口开着但系统代理没接管」的中间态。
+func (a *App) startDeep(cfg *config.Config) error {
 	a.deepMu.Lock()
 	if a.proxy == nil {
 		localAddrs := physicalNICIPs()
@@ -1070,9 +899,6 @@ func (a *App) startDeep(cfg *config.Config, mode string, compat bool) error {
 			a.logf("VPN 兼容：探测到物理网卡源地址 %v，拨号竞速将附带绑定源地址的入口", localAddrs)
 		} else {
 			a.logf("VPN 兼容：未探测到可用的物理网卡 IPv4，拨号走普通路径")
-		}
-		if compat {
-			a.logf("深度加速以兼容模式启动：不做 TLS 分片，纯 CONNECT 隧道")
 		}
 		srv := webproxy.New(webproxy.Options{
 			Listen: cfg.WebProxy.Listen,
@@ -1084,13 +910,13 @@ func (a *App) startDeep(cfg *config.Config, mode string, compat bool) error {
 			Resolve: a.resolveHosts, // 502 的根因修复：连优选 IP，不走被污染的本地 DNS
 			// 全部候选都拨不通 → 作废缓存，别拿同一批死 IP 反复撞
 			ResolveInvalidate: a.invalidateHostIP,
-			DialTimeout: time.Duration(cfg.WebProxy.DialTimeoutMS) * time.Millisecond,
-			DisableSplit:      compat,
+			DialTimeout:       time.Duration(cfg.WebProxy.DialTimeoutMS) * time.Millisecond,
 			LocalAddrs:        localAddrs,
-			// 自动避让：公司 VPN 等环境拦截加速流量时，连续全败即自动关闭，
-			// 防止用户网页全卡死（回调在独立协程里执行，可安全 Stop）
-			OnAutoFallback: a.autoFallbackDeep,
-			Logf:              a.logf,
+			// 静默降级：分片被中间设备拦到一定次数就自己切隧道，
+			// 只回调一次用于更新状态栏，不弹窗、不关加速
+			OnDegrade:    a.onDeepDegrade,
+			DegradeAfter: 3,
+			Logf:         a.logf,
 		})
 		if _, err := srv.Start(); err != nil {
 			a.deepMu.Unlock()
@@ -1102,8 +928,19 @@ func (a *App) startDeep(cfg *config.Config, mode string, compat bool) error {
 	addr := a.proxy.Addr()
 	a.deepMu.Unlock()
 
-	if mode == DeepModeAuto {
+	// 守卫进程：从现在起，哪怕主进程被任务管理器强杀，系统代理也会被还原。
+	// 懒派生——免费用户不开深度加速就完全不占额外进程。
+	a.ensureGuard(cfg)
+
+	{
+		// 与后台还原互斥：避免「刚接管好又被上一轮的迟到还原写回直连」
+		a.restoreMu.Lock()
 		res, err := sysproxy.Apply(addr)
+		if err == nil {
+			// 接管成功 → 代际 +1；此后任何更早的还原都会在锁内发现代际不符而作废
+			a.deepGen.Add(1)
+		}
+		a.restoreMu.Unlock()
 		if err == nil {
 			a.deepMu.Lock()
 			a.bypassRemoved = append([]string(nil), res.RemovedBypass...)
@@ -1131,249 +968,166 @@ func (a *App) startDeep(cfg *config.Config, mode string, compat bool) error {
 		}
 	}
 	a.deepMu.Lock()
-	a.deepMode = mode
-	a.deepCompat = compat
+	a.deepMode = DeepModeAuto
+	a.deepCompat = false
+	a.deepDegraded = false // 每次重新开启都从「分片模式」开始试
 	a.deepMu.Unlock()
 	a.deepOn.Store(true)
 	a.emitState()
 	return nil
 }
 
-// stopDeep 关闭深度加速：**先精准还原系统代理**（网络优先恢复），再断开本地端口。
-// 手动模式下系统代理本来就没改，Restore 会识别出「不是我们的」并原样跳过。
-func (a *App) stopDeep() {
+// restoreProxyFn 是系统代理还原的注入点（单测替换成可控的慢速/失败桩）。
+var restoreProxyFn = sysproxy.Restore
+
+// stopDeep 关闭深度加速，**返回一个在系统代理还原完成后关闭的 channel**。
+//
+// 为什么拆两段（这是「关闭卡好几秒」的根因修复）：
+//  1. sysproxy.Restore 要读注册表 → 写注册表 → InternetSetOptionW 广播，
+//     被 VPN / 安全软件拦的时候能停好几秒；
+//  2. 本地代理 Stop 也可能要等正在拨号的请求退出来。
+//
+// 这两件都不该让用户在按钮上等。所以同步段只做三件微秒级的事——
+// 摘掉状态、释放监听端口、标记已关闭；还原动作丢进 goroutine，
+// 完成后发 deep:closed 事件，前端据此把 Toast 从「正在清理」改成「已还原」。
+//
+// 调用方：SetDeepAccel / RemoveHosts 走异步（要丝滑）；
+// Shutdown 走 stopDeepWait（退出前必须尽量等完，否则用户断网）。
+func (a *App) stopDeep() <-chan struct{} {
 	a.deepMu.Lock()
-	defer a.deepMu.Unlock()
-	if _, err := sysproxy.Restore(a.targetAddr()); err != nil {
-		// 还原失败必须让用户知道（否则可能上不了网），但仍要把代理端口关掉
-		a.emitStatus("还原系统代理失败: "+err.Error(), "err")
-	}
-	if a.proxy != nil {
-		_ = a.proxy.Stop()
-		a.proxy = nil
-		a.deepAddr = ""
-	}
+	srv := a.proxy
+	a.proxy = nil
+	a.deepAddr = ""
+	a.deepDegraded = false
+	a.bypassRemoved = nil
 	a.deepOn.Store(false)
+	a.deepMu.Unlock()
+
+	// 释放监听端口 + 暴力切断在途隧道；Stop 已改为不等 wg，微秒级返回。
+	// 必须先放端口再还原注册表：否则用户紧接着再点开启会撞端口占用。
+	if srv != nil {
+		_ = srv.Stop()
+	}
+
+	// 记下当前代际：还原前若代际变了，说明用户已经重新开启，这次还原作废。
+	gen := a.deepGen.Load()
+	target := a.targetAddr()
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		a.restoreSystemProxy(gen, target)
+	}()
+	return done
 }
 
-// autoFallbackDeep 是代理触发的「自动避让」：连续多轮全部候选失败时
-// 自动关闭深度加速，把开关变灰，并通知前端弹友好提示。
-// 只在深度加速确实开着时生效；Hosts 模式（一键智能加速）不受任何影响。
-func (a *App) autoFallbackDeep(reason string) {
-	if a.ctx == nil || !a.deepOn.Load() {
+// stopDeepWait 是 stopDeep 的同步版：最多等 timeout，超时就不再等
+// （还原动作仍在后台跑，另有守卫进程兜底）。
+func (a *App) stopDeepWait(timeout time.Duration) {
+	done := a.stopDeep()
+	select {
+	case <-done:
+	case <-time.After(timeout):
+		a.logf("等待系统代理还原超过 %v，不再阻塞退出（守卫进程会兜底）", timeout)
+	}
+}
+
+// restoreSystemProxy 在后台还原系统代理，完成后广播 deep:closed。
+//
+// 事件字段：ok=true 表示已还原（含「本来就没接管」和「已作废」两种正常情况），
+// err 非空表示还原失败（UI 必须明说，否则用户可能上不了网还不知道原因）。
+func (a *App) restoreSystemProxy(gen int64, target string) {
+	start := time.Now()
+	defer func() {
+		if r := recover(); r != nil {
+			a.logf("还原系统代理时发生异常: %v", r)
+			a.emitDeepClosed(false, fmt.Sprint(r), time.Since(start), false)
+		}
+	}()
+
+	// 与接管互斥：拿到锁之后再校验代际，彻底堵死「检查通过 → 用户点开 →
+	// 还原把新接管写回直连」的竞态窗口。
+	a.restoreMu.Lock()
+	if a.deepGen.Load() != gen || a.deepOn.Load() {
+		a.restoreMu.Unlock()
+		a.logf("跳过过期的系统代理还原（期间已重新开启深度加速）")
+		a.emitDeepClosed(true, "", time.Since(start), true)
 		return
 	}
-	a.logf("Auto-Fallback: 自动关闭深度加速，原因: %s", reason)
-	a.stopDeep()
-	// 开关状态持久化为关闭，重启后不会自动恢复一个已被判定不可用的功能
-	st := a.loadLicenseState()
-	st.DeepAccel = false
-	_ = a.saveLicenseState(st)
-	// 要求 3：Hosts 模式可用性——只要区块里还有有效记录就不算失效，如实上报
-	hostsLeft := 0
-	if entries, err := executor.ReadHostsBlock(); err == nil {
-		hostsLeft = len(entries)
+	ok, err := restoreProxyFn(target)
+	a.restoreMu.Unlock()
+	ms := time.Since(start).Milliseconds()
+	if err != nil {
+		a.logf("还原系统代理失败（耗时 %dms）: %v", ms, err)
+		a.emitDeepClosed(false, err.Error(), time.Since(start), false)
+		return
 	}
-	a.emitState()
-	runtime.EventsEmit(a.ctx, "deep:autofallback", map[string]any{
-		"reason":       reason,
-		"state":        a.proState(),
-		"hostsEntries": hostsLeft,
+	a.logf("系统代理已还原（changed=%v，耗时 %dms）", ok, ms)
+	a.emitDeepClosed(true, "", time.Since(start), false)
+}
+
+// emitDeepClosedEvent 是事件出口的注入点（单测替换它抓 payload）。
+var emitDeepClosedEvent = func(a *App, payload map[string]any) {
+	if a.ctx == nil {
+		return
+	}
+	runtime.EventsEmit(a.ctx, "deep:closed", payload)
+}
+
+// emitDeepClosed 广播「深度加速已彻底关闭、系统代理已还原」。
+func (a *App) emitDeepClosed(ok bool, errMsg string, d time.Duration, skipped bool) {
+	payload := map[string]any{
+		"ok":      ok,
+		"ms":      d.Milliseconds(),
+		"skipped": skipped,
+	}
+	if errMsg != "" {
+		payload["err"] = errMsg
+	}
+	emitDeepClosedEvent(a, payload)
+}
+
+// guardSpawn 是守卫进程的派生入口（测试替换，避免在单测里拉起真实子进程）。
+var guardSpawn = proxyguard.Spawn
+
+// ensureGuard 懒派生守卫进程（每个进程生命周期内只派生一次）。
+//
+// 职责边界：守卫不参与正常业务，只做一件事——盯着主进程句柄，
+// 主进程一死（含被任务管理器强杀）就按备份把系统代理还原掉。
+// 免费用户不开深度加速时不会派生，不额外占内存。
+func (a *App) ensureGuard(cfg *config.Config) {
+	a.guardOnce.Do(func() {
+		target := cfg.WebProxy.Listen
+		if target == "" {
+			target = sysproxy.DefaultTarget
+		}
+		g, err := guardSpawn(a.job, target)
+		if err != nil {
+			a.logf("守卫进程启动异常（强杀还原能力可能受限）: %v", err)
+		}
+		if g != nil {
+			a.guard = g
+			a.logf("守卫进程已就绪 pid=%d：主进程被强杀也会还原系统代理", g.Pid())
+		} else {
+			a.logf("守卫进程未能启动：强杀后仅靠下次启动自检恢复")
+		}
 	})
 }
 
-// classifyNetErr 把底层探测错误翻译成用户能看懂的失败原因（透明化）。
-func classifyNetErr(errStr string) string {
-	s := strings.ToLower(errStr)
-	switch {
-	case strings.Contains(s, "no such host") || strings.Contains(s, "lookup"):
-		return "DNS 解析失败"
-	case strings.Contains(s, "tcp 失败") && strings.Contains(s, "i/o timeout"):
-		return "TCP 连接超时（IP 不可达或被防火墙/VPN 拦截）"
-	case strings.Contains(s, "tls 失败") && (strings.Contains(s, "reset") || strings.Contains(s, "forcibly closed")):
-		return "TLS 握手被重置（典型的 VPN/防火墙代答拦截）"
-	case strings.Contains(s, "tls 失败") && strings.Contains(s, "i/o timeout"):
-		return "TLS 握手超时（连接被静默丢弃）"
-	case strings.Contains(s, "certificate"):
-		return "证书校验失败（连上的不是真 GitHub，DNS 被污染）"
-	default:
-		return errStr
-	}
-}
-
-// deepCheckResult 是实时微测的完整结果：是否可用 + 逐条诊断明细。
-type deepCheckResult struct {
-	OK      bool
-	Checked int      // 实际尝试的候选 IP 数
-	Detail  []string // 给用户看的失败原因明细（成功时可能为空）
-}
-
-// deepLiveCheckTimeout 是「深度加速」实时预检微测的总预算。
-// 号主定稿：2 秒即可——够一次真实 TCP+TLS 握手，又不至于让用户干等。
-const deepLiveCheckTimeout = 2 * time.Second
-
-// deepRestrictedMsg 是实时微测全部失败时的提示文案（号主定稿，勿改字）。
-const deepRestrictedMsg = "当前网络环境依然受限，请确保已彻底关闭公司 VPN 后重试。若仍不行，请仅使用「一键智能加速」。"
-
-// deepProbeFn 是实时连通性微测的实现（测试可替换），默认走 probe.ProbeIPs
-// ——真实的 TCP 连接 + SNI 严格校验证书 TLS 握手 + HTTP 应答。
-var deepProbeFn = probe.ProbeIPs
-
-// directTLSCheck 是最小保底微测：系统 DNS 直连 domain:443，做一次
-// 严格校验证书的 TLS 握手。用于「一个候选 IP 都拿不到」时仍能判定网络是否恢复。
-var directTLSCheck = func(domain string, timeout time.Duration) (bool, error) {
-	nc, err := (&net.Dialer{Timeout: timeout}).Dial("tcp", net.JoinHostPort(domain, "443"))
-	if err != nil {
-		return false, err
-	}
-	defer nc.Close()
-	conn := tls.Client(nc, &tls.Config{ServerName: domain, MinVersion: tls.VersionTLS12})
-	_ = nc.SetDeadline(time.Now().Add(timeout))
-	if err := conn.Handshake(); err != nil {
-		return false, err
-	}
-	_ = conn.Close()
-	return true, nil
-}
-
-// dohResolveCap 是预检里 DoH 现解析的时间上限：只为补充候选 IP，
-// 拿不到就直连兜底，绝不能把整个 2 秒预算耗在 DNS 上（国内 DoH 常被墙）。
-const dohResolveCap = 700 * time.Millisecond
-
-// deepCandidatesFn 是候选收集的可注入入口（测试用来造「候选为空」场景，
-// 验证拿不到任何 IP 时会退回直连 TLS 兜底，而不是误判成网络受限）。
-var deepCandidatesFn = func(a *App, ctx context.Context, cfg *config.Config, domain string, dohTimeout time.Duration, detail *[]string) []string {
-	return a.deepCandidates(ctx, cfg, domain, dohTimeout, detail)
-}
-
-// deepCandidates 收集实时微测的候选 IP（最多 4 个，按「最可能通」排序）：
-// Hosts 现有记录 → 优选缓存 → DoH 解析（受 dohTimeout 限制）。
-// detail 记录候选收集过程，微测失败时原样展示给用户。
-func (a *App) deepCandidates(ctx context.Context, cfg *config.Config, domain string, dohTimeout time.Duration, detail *[]string) []string {
-	seen := make(map[string]bool, 4)
-	out := make([]string, 0, 4)
-	add := func(ip string) {
-		if ip == "" || len(out) >= 4 || seen[ip] || net.ParseIP(ip) == nil {
-			return
-		}
-		seen[ip] = true
-		out = append(out, ip)
-	}
-	// 1. Hosts 里正在生效的记录（用户点过一键加速才会写）
-	if entries, err := executor.ReadHostsBlock(); err == nil {
-		if ip := entries[domain]; ip != "" {
-			*detail = append(*detail, "候选来源·Hosts 现有记录: "+ip)
-			add(ip)
-		}
-	}
-	// 2. 优选缓存（上次探测成功的结果）
-	if m, _, err := cache.Load(); err == nil {
-		if ip := m[domain]; ip != "" {
-			*detail = append(*detail, "候选来源·优选缓存: "+ip)
-			add(ip)
-		}
-	}
-	// 3. DoH 现解析（拿不到新 IP 也不影响前两步）
-	if len(out) < 4 && len(cfg.DoHEndpoints) > 0 {
-		dctx, cancel := context.WithTimeout(ctx, dohTimeout)
-		defer cancel()
-		ips, err := doh.ResolveWith(dctx, domain, cfg.DoHEndpoints)
-		if err != nil {
-			*detail = append(*detail, "候选来源·DoH 解析失败: "+classifyNetErr(err.Error()))
-		} else if got := doh.DedupIPStrings(ips); len(got) == 0 {
-			*detail = append(*detail, "候选来源·DoH 解析成功但无应答记录")
-		} else {
-			for _, ip := range got {
-				add(ip)
-			}
-		}
-	}
-	return out
-}
-
-// deepLiveCheck 立刻做一次针对主域名的真实 TCP/TLS 连通性微测。
-// 任一候选探测通过即放行；候选全空时退回系统 DNS 直连 TLS 握手。
-// 总耗时受 deepLiveCheckTimeout 约束（DoH 现解析最多占 dohResolveCap，
-// 剩余时间全部留给真正的连通性探测）。Detail 带逐条失败原因（透明化）。
-func (a *App) deepLiveCheck(cfg *config.Config, domain string) deepCheckResult {
-	if domain == "" {
-		return deepCheckResult{OK: true} // 没配域名就没有可拦的依据
-	}
-	deadline := time.Now().Add(deepLiveCheckTimeout)
-	ctx, cancel := context.WithDeadline(context.Background(), deadline)
-	defer cancel()
-
-	detail := make([]string, 0, 8)
-	ips := deepCandidatesFn(a, ctx, cfg, domain, dohResolveCap, &detail)
-	remain := time.Until(deadline)
-	if remain < 300*time.Millisecond {
-		remain = 300 * time.Millisecond // 保底握手时间；总耗时最多约 2.3 秒
-	}
-	if len(ips) == 0 {
-		ok, err := directTLSCheck(domain, remain)
-		if ok {
-			return deepCheckResult{OK: true}
-		}
-		detail = append(detail, "系统 DNS 直连 "+domain+":443 失败: "+classifyNetErr(err.Error()))
-		return deepCheckResult{Checked: 0, Detail: detail}
-	}
-	pctx, pcancel := context.WithTimeout(context.Background(), remain)
-	defer pcancel()
-	for _, r := range deepProbeFn(pctx, ips, domain, remain) {
-		if r.OK {
-			return deepCheckResult{OK: true, Checked: len(ips)}
-		}
-		if r.Err != "" {
-			detail = append(detail, "候选 "+r.IP+": "+classifyNetErr(r.Err))
-		}
-	}
-	return deepCheckResult{Checked: len(ips), Detail: detail}
-}
-
-// deepPrecheckLive 是深度加速的预检闸，只认「此刻的真实连通性」。
+// onDeepDegrade 是代理层「静默降级」的回调。
 //
-// 历史教训：旧实现读 lastprobe.json（上一轮探测报告）判定，用户在 VPN 下
-// 失败过一次后，即使关掉 VPN、网络已恢复，6 小时内仍会被旧报告拦截。
-// 现在改为实时微测：通就放行（并清掉旧失败报告），确实不通才拦截——
-// 拦截时附上逐条失败原因（detail），UI 提供「仍然强制开启」逃生通道。
-func (a *App) deepPrecheckLive(domain string) (ok bool, reason string, checked int, detail []string) {
-	cfg := a.loadCfg()
-	res := a.deepLiveCheck(cfg, domain)
-	if res.OK {
-		// 网络已恢复：旧的失败报告立刻作废，避免下次再拿它当依据
-		if err := cache.ClearProbeReport(); err != nil {
-			a.logf("清理历史探测报告失败（不影响放行）: %v", err)
-		}
-		return true, "", res.Checked, nil
+// 含义：中间设备把分片的 TLS 握手当异常流量掐得太狠，代理自己切成纯隧道继续工作。
+// 这里**只**做两件事：记日志 + 把状态栏换成「已开启 · 智能降级」。
+// 不弹窗、不关加速、不要求用户做任何选择——这才是「底层自愈」该有的样子。
+func (a *App) onDeepDegrade(reason string) {
+	a.deepMu.Lock()
+	a.deepDegraded = true
+	a.deepMu.Unlock()
+	a.logf("深度加速已智能降级为纯隧道（原因: %s）", reason)
+	if a.ctx != nil {
+		runtime.EventsEmit(a.ctx, "deep:degraded", map[string]any{"reason": reason})
 	}
-	return false, deepRestrictedMsg, res.Checked, res.Detail
-}
-
-// CheckDeepPrecondition 供前端在打开「深度加速」弹窗前调用：
-// 每次都现场发起 2 秒实时微测，拦截时返回 reason + 逐条诊断明细（detail）。
-func (a *App) CheckDeepPrecondition() map[string]any {
-	ok, reason, checked, detail := a.deepPrecheckLive(a.primaryDomain())
-	a.logf("深度加速预检（实时微测）: ok=%v 候选=%d", ok, checked)
-	return map[string]any{
-		"ok":      ok,
-		"reason":  reason,
-		"domain":  a.primaryDomain(),
-		"checked": checked,
-		"live":    true,
-		"detail":  detail,
-	}
-}
-
-// RefreshDeepPrecondition 是「网络体检·重新检测」：强制清空探测报告与
-// 代理侧 IP 缓存（DoH 每次都是现查、无本地缓存），然后立刻重跑实时微测，
-// 保证用户点刷新时绝不被任何陈旧状态卡死。
-func (a *App) RefreshDeepPrecondition() map[string]any {
-	a.invalidateAllHostIP()
-	if err := cache.ClearProbeReport(); err != nil {
-		a.logf("网络体检清理探测报告失败: %v", err)
-	}
-	a.logf("网络体检: 已清空探测报告与 IP 缓存，重新实时微测")
-	return a.CheckDeepPrecondition()
+	a.emitStatus("已开启 · 智能降级", "ok")
+	a.emitState()
 }
 
 // primaryDomain 返回配置域名列表的主域名（github.com）；列表为空返回空串。
