@@ -87,10 +87,10 @@ var DefaultEndpoints = []string{
 // DefaultDomains 是未配置域名时的默认目标域名。
 var DefaultDomains = []string{
 	"github.com",
-	"assets-cdn.github.com",
 	"github.global.ssl.fastly.net",
 	"raw.githubusercontent.com",
 	"objects.githubusercontent.com",
+	"release-assets.githubusercontent.com",
 }
 
 // Load 从 path 读取 YAML 配置；文件不存在或字段缺失时使用内置默认值。

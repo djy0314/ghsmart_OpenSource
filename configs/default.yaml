@@ -8,6 +8,7 @@ domains:
   - github.global.ssl.fastly.net
   - raw.githubusercontent.com
   - objects.githubusercontent.com
+  - release-assets.githubusercontent.com   # GitHub 新版 Release 资产 CDN（v1.0.7 补入，此前未覆盖）
 probe_timeout: 5s
 interval: 10m
 max_concurrent: 10

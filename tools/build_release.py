@@ -44,9 +44,14 @@ def main():
 
     env = dict(os.environ)
     env["GOROOT"] = GOROOT
-    env["PATH"] = os.path.join(GOROOT, "bin") + os.pathsep + env.get("PATH", "")
+    gobin = os.path.join(os.environ.get("USERPROFILE", ""), "go", "bin")
+    env["PATH"] = (os.path.join(GOROOT, "bin") + os.pathsep + gobin + os.pathsep
+                   + env.get("PATH", ""))
     for k in ("HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy", "all_proxy"):
         env.pop(k, None)
+    wails_exe = os.path.join(gobin, "wails.exe")
+    if not os.path.isfile(wails_exe):
+        wails_exe = "wails"
 
     step(1, "前置检查")
     manifest = open(os.path.join(ROOT, "build", "windows", "wails.exe.manifest"),
@@ -64,7 +69,7 @@ def main():
     print("  前端版本号: %s OK" % tag)
 
     step(2, "wails build（garble 混淆 + selfcheck 标签）")
-    cmd = ["wails", "build", "-compiler", "garble-lit", "-tags", "selfcheck",
+    cmd = [wails_exe, "build", "-compiler", "garble-lit", "-tags", "selfcheck",
            "-trimpath", "-m", "-skipbindings"]
     r = subprocess.run(cmd, cwd=ROOT, env=env, capture_output=True, text=True)
     out = r.stdout + r.stderr

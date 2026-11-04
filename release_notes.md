@@ -1,3 +1,36 @@
+# ghsmart v1.0.7 — 加速池补全 · 隐私收口
+
+> GitHub 打不开、clone 慢？一键搞定。
+> 纯本地运行 · 无广告 · 免安装 · 无需安装证书 · 不经过任何中转服务器
+
+## 🛡️ 本版改动（v1.0.7）—— 把「下载安装包也加速」补上
+
+### 1. Release 下载 CDN 纳入加速池
+- GitHub 的 Release 附件走独立 CDN `release-assets.githubusercontent.com`，
+  旧版加速池只覆盖 `objects.githubusercontent.com`，导致下载安装包本身
+  走不到加速（实测单连接仅 20~40KB/s）
+- 本版把它纳入优选与应急 IP 池，防 DNS 污染时无兜底
+
+### 2. 隐私收口
+- 构建启用 `-trimpath`：产物不再包含本机编译路径、用户名等环境信息
+- 包内 README 不再包含任何联系方式明文，购买渠道统一指向官网
+
+### 3. 清理
+- 内置兜底域名列表移除死域名 `assets-cdn.github.com`（GitHub 官方早已迁移）
+
+### 4. 保留
+- v1.0.6 的三层防护全部保留：Garble 深度混淆、启动自校验、密钥红线
+- v1.0.5 的 DoH 并发竞速、端点健康记忆、应急 IP 池全部保留
+
+## 📦 下载与校验（v1.0.7）
+
+```
+SHA256(ghsmart_v1.0.7.zip): 30A9C93003809D43310C3BBCD1526F92A0179B919C555C1DE610924E374DF4CF
+SHA256(ghsmart.exe):        40243A5A7742688BB9C32CE6D154980AAB24A841E402AA6594BD085D036C00EA
+```
+
+---
+
 # ghsmart v1.0.6 — 三层商业防护上线：混淆 · 自校验 · 密钥拦截
 
 > GitHub 打不开、clone 慢？一键搞定。
@@ -341,4 +374,4 @@ v1.0.1 已修：退出带 watchdog 兜底，2 秒内必定结束进程并撤掉�
 ---
 
 官方主页：**https://tools.zf314.cn**
-作者微信：**1539192493**（PRO 购买 / 问题反馈）
+购买 / 问题反馈：**https://tools.zf314.cn**
