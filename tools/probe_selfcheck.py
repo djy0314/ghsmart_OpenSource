@@ -18,6 +18,7 @@ import os
 import shutil
 import subprocess
 import sys
+import time
 import tempfile
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -61,20 +62,37 @@ def main():
 
     stamp_py = os.path.join(ROOT, "tools", "patch_selfstamp.py")
 
+    def stamp(path, tries=4):
+        """回填自校验戳，带重试。
+
+        Windows 上刚被 run() 执行过的 exe，其文件句柄可能晚几百毫秒才释放，
+        此时 patch 的 open('wb') 会抛 PermissionError。这不是产品缺陷，
+        也不该让验收假失败——所以显式重试，并把最后一次的 stderr 带出来。
+        """
+        last = None
+        for i in range(tries):
+            r = subprocess.run([sys.executable, stamp_py, path], capture_output=True)
+            if r.returncode == 0:
+                return r
+            last = r
+            time.sleep(0.25 * (i + 1))
+        return last
+
     # A 未回填
     code, out = run(base)
     check("A 未回填 -> 拒绝", code == 3 and "VERIFY FAIL" in out, "code=%d %s" % (code, out[:60]))
 
     # B 正确回填
-    r = subprocess.run([sys.executable, stamp_py, base], capture_output=True)
+    r = stamp(base)
     stamped_ok = r.returncode == 0
     code, out = run(base)
     check("B 正确回填 -> 放行", stamped_ok and code == 0 and "VERIFY OK" in out,
-          "code=%d %s" % (code, out[:60]))
+          "code=%d stamp_rc=%d %s %s" % (code, r.returncode, out[:50],
+                                         r.stderr.decode("utf-8", "replace")[:120]))
 
     # 二次回填幂等
     before = open(base, "rb").read()
-    r2 = subprocess.run([sys.executable, stamp_py, base], capture_output=True)
+    r2 = stamp(base)
     after = open(base, "rb").read()
     check("G 二次回填幂等", r2.returncode == 0 and before == after,
           "rc=%d size %d->%d" % (r2.returncode, len(before), len(after)))

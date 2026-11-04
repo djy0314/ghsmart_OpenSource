@@ -19,6 +19,7 @@ import (
 	"github.com/wailsapp/wails/v2/pkg/runtime"
 	syswin "golang.org/x/sys/windows"
 
+	"ghsmart/internal/autostart"
 	"ghsmart/internal/cache"
 	"ghsmart/internal/config"
 	"ghsmart/internal/doh"
@@ -77,6 +78,15 @@ type App struct {
 	// 诊断日志（GUI 无控制台，写 ~/.ghsmart/ghsmart.log）
 	logMu   sync.Mutex
 	logFile *os.File
+
+	// silent 表示本次是「开机自启」带起来的（--silent）：
+	// 窗口隐藏到托盘，其余状态恢复逻辑与手动打开完全一致。
+	silent bool
+
+	// 开机自启状态缓存：查询要 fork schtasks（几十毫秒），
+	// 不能每次 emitState 都查；只在启动与切换后刷新。
+	autoMu sync.Mutex
+	autoSt autostart.Status
 }
 
 // NewApp 创建应用实例。
@@ -87,9 +97,19 @@ func NewApp() *App {
 // startup 由 Wails 在窗口创建后回调，保存运行时上下文。
 // 已持久化的 Pro 授权在此做离线复验（到期/机器码变更会拒绝），通过则恢复解锁；
 // 自动自愈开关处于开启状态时顺带拉起后台循环。
+//
+// silent=true 表示这次是「开机自启」带起来的（--silent）：窗口隐藏到托盘，
+// 但状态恢复逻辑与手动打开完全一致——用户下次看主界面时，开关已经是打开的样子。
 func (a *App) startup(ctx context.Context) {
 	a.ctx = ctx
 	cfg := a.loadCfg()
+	st := a.loadLicenseState()
+
+	// v1.0.8 迁移：旧版**无条件**写过 git@github.com: 与 ssh:// 的改写。
+	// 光改代码不改存量等于没修——老用户升级后，那三条 insteadOf 还留在
+	// 他的全局配置里，SSH 推送照样是坏的。所以升级后第一次启动强制对齐一次。
+	st = a.migrateGit108(st)
+
 	// 第一件事：如果上次是异常退出（进程被强杀）导致系统代理还指着本机，
 	// 立刻按「精准核对」还原——只有确实指向我们时才动，第三方代理绝不覆盖。
 	if restored, err := sysproxy.Recover(cfg.WebProxy.Listen); err != nil {
@@ -101,7 +121,7 @@ func (a *App) startup(ctx context.Context) {
 	// 只要「系统代理指向我们的端口但端口无人监听」就强制关闭——
 	// 绝不让用户一开机就全网断连（公司域名全打不开的那种）。
 	a.cleanZombieProxy(cfg.WebProxy.Listen)
-	if st := a.loadLicenseState(); st.Key != "" {
+	if st.Key != "" {
 		if ok, err := license.VerifyOffline(st.Key); err == nil && ok {
 			a.pro.Store(true)
 			if st.AutoHeal {
@@ -119,7 +139,13 @@ func (a *App) startup(ctx context.Context) {
 	// ★ 缓存秒应用：上次探测成功的最优 IP 直接恢复加速（免费版无条件），
 	// 打开软件即用，无需再点按钮；随后后台静默校验更优 IP。
 	a.applyCacheOnStartup(cfg)
+	// 查一次自启状态（要 fork schtasks，只查这一次，之后走缓存）。
+	a.refreshAutoStatus()
 	a.emitState()
+	if a.silent {
+		a.logf("静默自启：已按上次状态恢复（深度加速=%v，自愈=%v，窗口隐藏到托盘）",
+			a.deepOn.Load(), a.healOn.Load())
+	}
 }
 
 func (a *App) deepListenAddr() string {
@@ -271,6 +297,9 @@ func (a *App) StartApply() error {
 	go func() {
 		defer a.busy.Store(false)
 		written, lines, restricted, err := engine.ApplyOnceOpts(cfg, guiReporter{a}, engine.Options{
+			// 档位由用户的「Git 加速（HTTPS 模式）」开关决定：
+			// 默认档只处理已停用的 git://，绝不改用户 SSH 推送路径。
+			GitLevel: a.gitLevel(),
 			// 主域名（github.com）一探测成功就立刻写入并通知 UI，
 			// 其余域名继续在后台探测（由引擎在收尾统一全量写入）。
 			OnPrimary: func(entries map[string]string) {
@@ -371,7 +400,9 @@ func (silentReporter) Warn(string)                                      {}
 // 发现更优 IP 时悄悄替换（引擎收尾已全量写入）并提示一次；
 // 结果与基线一致则只记日志，绝不刷屏。
 func (a *App) revalidateSilently(cfg *config.Config, baseline map[string]string) {
-	written, _, restricted, err := engine.ApplyOnce(cfg, silentReporter{})
+	written, _, restricted, err := engine.ApplyOnceOpts(cfg, silentReporter{}, engine.Options{
+		GitLevel: a.gitLevel(),
+	})
 	a.invalidateAllHostIP()
 	// 后台校验发现受限网络：清缓存 + 通知前端弹红色警告（秒应用写入的死 IP 已被引擎清出 Hosts）
 	if restricted {
@@ -590,6 +621,16 @@ type licenseState struct {
 	DeepAccel   bool   `json:"deep_accel"`   // 深度网页加速开关状态
 	DeepMode    string `json:"deep_mode"`    // 深度加速模式：auto / manual
 	DeepCompat  bool   `json:"deep_compat"`  // 深度加速兼容模式（公司 VPN 场景，不做 TLS 分片）
+
+	// v1.0.8 新增：三个「无感」相关开关的记忆，重启后按上次状态恢复。
+	GitHTTPS    bool `json:"git_https"`     // Git 加速（HTTPS 模式）：是否改写 SSH 到 HTTPS
+	CLIProxyEnv bool `json:"cli_proxy_env"` // 命令行加速：是否同时写用户级环境变量（gh/curl）
+	AutoStart   bool `json:"auto_start"`    // 开机自启并最小化到托盘
+
+	// Migrated108 标记「v1.0.8 的 git 改写迁移」已执行过。
+	// 旧版无条件把 SSH 改写成 HTTPS，升级后必须主动清一次存量，
+	// 否则改代码等于没改（用户的 git push 还是坏的）。只做一次，不反复 fork git。
+	Migrated108 bool `json:"migrated_108"`
 }
 
 // licensePath 返回授权状态文件路径（默认 ~/.ghsmart/license.json）。
@@ -691,13 +732,24 @@ func (a *App) GetProState() map[string]any {
 
 // proState 组装当前授权状态（唯一事实来源），供各绑定方法回传给前端。
 func (a *App) proState() map[string]any {
+	st := a.loadLicenseState()
 	m := map[string]any{
 		"pro":        a.pro.Load(),
 		"autoHeal":   a.healOn.Load(),
 		"deepAccel":  a.deepOn.Load(),
 		"deepListen": "",
 		"deepMode":   "",
+		// v1.0.8：三个「无感/安全」开关的真实状态
+		"gitHTTPS":    st.GitHTTPS,
+		"cliProxyEnv": st.CLIProxyEnv,
+		"silent":      a.silent,
 	}
+	// 自启状态走内存缓存：查询要 fork schtasks，不能每次 emitState 都做。
+	auto := a.autoStatus()
+	m["autoStart"] = auto.Enabled
+	m["autoStartMode"] = string(auto.Mode)
+	m["autoStartNeedsUAC"] = auto.NeedsUAC
+	m["autoStartDetail"] = auto.Detail
 	a.deepMu.Lock()
 	if a.deepMode != "" {
 		m["deepMode"] = a.deepMode
@@ -711,6 +763,179 @@ func (a *App) proState() map[string]any {
 	m["bypassRemoved"] = append([]string(nil), a.bypassRemoved...)
 	a.deepMu.Unlock()
 	return m
+}
+
+// migrateGit108 处理「从旧版升级上来」的 git 配置存量。
+//
+// 背景：v1.0.7 及更早**无条件**把 git@github.com: / ssh:// 改写成 HTTPS，
+// 这会打断用 SSH key 推送的用户。v1.0.8 改成默认档不碰 SSH，但存量不会自己消失——
+// 老用户升级后必须主动清一次，否则「修了 bug 但用户的 git push 还是坏的」。
+//
+// 只做一次（Migrated108 标记），之后每次启动只按用户选择恢复 HTTPS 模式，
+// 绝不反复 fork git 子进程去写配置。
+func (a *App) migrateGit108(st licenseState) licenseState {
+	level := executor.GitRewriteGitOnly
+	if st.GitHTTPS {
+		level = executor.GitRewriteSSH
+	}
+
+	if st.Migrated108 {
+		// 已迁移过：只在用户主动开着 HTTPS 模式时恢复，其余什么都不做
+		if st.GitHTTPS {
+			if err := executor.ApplyGit(level); err != nil {
+				a.logf("恢复 Git HTTPS 模式失败（不影响主流程）: %v", err)
+			}
+		}
+		return st
+	}
+
+	if err := executor.ApplyGit(level); err != nil {
+		// 未装 git 等情况：不写标记，下次启动再试（不影响主流程）
+		a.logf("v1.0.8 迁移：git 改写对齐失败（下次启动重试）: %v", err)
+		return st
+	}
+	st.Migrated108 = true
+	if serr := a.saveLicenseState(st); serr != nil {
+		a.logf("记录 v1.0.8 迁移标记失败: %v", serr)
+	}
+	a.logf("v1.0.8 迁移：git 改写已对齐到 %s 档（旧版遗留的 SSH 改写已按需清除）", level)
+	return st
+}
+
+// gitLevel 返回当前应使用的 git 改写档位（用户开关决定）。
+func (a *App) gitLevel() string {
+	if a.loadLicenseState().GitHTTPS {
+		return executor.GitRewriteSSH
+	}
+	return executor.GitRewriteGitOnly
+}
+
+// autoStatus 读取自启状态缓存（启动时与每次切换后刷新）。
+func (a *App) autoStatus() autostart.Status {
+	a.autoMu.Lock()
+	defer a.autoMu.Unlock()
+	if a.autoSt.Mode == "" {
+		return autostart.Status{Mode: autostart.ModeNone, Detail: "未开启"}
+	}
+	return a.autoSt
+}
+
+// refreshAutoStatus 重新查询并写入缓存。
+func (a *App) refreshAutoStatus() autostart.Status {
+	st := autostart.Query()
+	a.autoMu.Lock()
+	a.autoSt = st
+	a.autoMu.Unlock()
+	return st
+}
+
+// syncCLIProxy 把「命令行加速」对齐到当前实际状态：
+//
+//	深度加速开着 → 写 git 按 URL 代理（只影响 github.com），
+//	               用户另外开了「环境变量」时才写 HTTP_PROXY/HTTPS_PROXY；
+//	深度加速关着 → 全部精确撤销。
+//
+// 内部要 fork git 子进程（几十毫秒），因此调用方都用 goroutine，
+// 绝不在 UI 线程同步等待。
+func (a *App) syncCLIProxy() {
+	a.deepMu.Lock()
+	srv := a.proxy
+	a.deepMu.Unlock()
+	if srv == nil {
+		if err := executor.RemoveCLIProxy(); err != nil {
+			a.logf("撤销命令行代理失败: %v", err)
+		}
+		return
+	}
+	st := a.loadLicenseState()
+	res, err := executor.ApplyCLIProxy(srv.Addr(), st.CLIProxyEnv)
+	if err != nil {
+		a.logf("命令行加速设置失败: %v", err)
+		a.emitStatus("命令行加速设置失败: "+err.Error(), "warn")
+		return
+	}
+	if res.Skipped != "" {
+		// 用户已有自己的代理环境变量：如实告诉他我们没动，别让人以为设成功了
+		a.emitStatus(res.Skipped, "warn")
+	}
+	a.logf("命令行加速: git 按 URL 代理=%v，环境变量=%v %s", res.GitApplied, res.EnvApplied, res.Detail)
+}
+
+// SetGitHTTPS 开关「Git 加速（HTTPS 模式）」。
+//
+// 开启后才会把 git@github.com: / ssh:// 改写成 HTTPS——这会改变 push 路径，
+// 所以必须由用户主动勾选，界面也要把代价说清楚。关闭时立即精确撤销，
+// SSH 推送能力当场恢复，不需要重启。
+func (a *App) SetGitHTTPS(on bool) (map[string]any, error) {
+	level := executor.GitRewriteGitOnly
+	if on {
+		level = executor.GitRewriteSSH
+	}
+	if err := executor.ApplyGit(level); err != nil {
+		return a.proState(), err
+	}
+	st := a.loadLicenseState()
+	st.GitHTTPS = on
+	if err := a.saveLicenseState(st); err != nil {
+		return a.proState(), fmt.Errorf("设置已生效，但保存状态失败（重启后会恢复默认）: %w", err)
+	}
+	a.logf("Git 加速档位切换为 %s（SSH 改写=%v）", level, on)
+	a.emitState()
+	return a.proState(), nil
+}
+
+// SetCLIProxyEnv 开关「命令行加速」里的环境变量部分（影响 gh / curl 等所有进程）。
+//
+// git 的按 URL 代理随深度加速自动生效，不需要这个开关；
+// 这里控制的是更重的手段：写用户级 HTTP_PROXY / HTTPS_PROXY。
+// 用户机器上已有自己的代理设置时，写入会被自动跳过并如实回报。
+func (a *App) SetCLIProxyEnv(on bool) (map[string]any, error) {
+	st := a.loadLicenseState()
+	st.CLIProxyEnv = on
+	if err := a.saveLicenseState(st); err != nil {
+		return a.proState(), fmt.Errorf("保存状态失败: %w", err)
+	}
+	go a.syncCLIProxy()
+	a.emitState()
+	return a.proState(), nil
+}
+
+// SetAutoStart 开关「开机自动启动并最小化到托盘」。
+//
+// 实际机制由 internal/autostart 决定：优先计划任务（免 UAC 静默启动），
+// 失败降级注册表 Run 键（开机会弹一次 UAC）。返回值里的
+// autoStartMode / autoStartNeedsUAC 就是真实生效的机制，
+// 界面必须按它渲染，不能一律说"已开启"。
+func (a *App) SetAutoStart(on bool) (map[string]any, error) {
+	exe, err := os.Executable()
+	if err != nil {
+		return a.proState(), fmt.Errorf("无法定位程序路径: %w", err)
+	}
+	var st autostart.Status
+	if on {
+		st, err = autostart.Enable(exe)
+	} else {
+		err = autostart.Disable()
+		if err == nil {
+			st = autostart.Status{Mode: autostart.ModeNone, Detail: "已关闭"}
+		}
+	}
+	a.autoMu.Lock()
+	a.autoSt = st
+	a.autoMu.Unlock()
+	if err == nil {
+		ls := a.loadLicenseState()
+		ls.AutoStart = on
+		if serr := a.saveLicenseState(ls); serr != nil {
+			a.logf("保存自启状态失败: %v", serr)
+		}
+		a.logf("开机自启: %v（机制=%s，需要 UAC=%v）%s", on, st.Mode, st.NeedsUAC, st.Detail)
+	}
+	a.emitState()
+	if err != nil {
+		return a.proState(), err
+	}
+	return a.proState(), nil
 }
 
 // SetAutoHeal 开关后台自动自愈（仅 Pro 可用），返回操作后的真实状态。
@@ -763,7 +988,9 @@ func (a *App) startHeal(cfg *config.Config) {
 					continue // 上一轮还没跑完，跳过本周期
 				}
 				a.emitStatus("后台自愈: 正在巡检...", "busy")
-				_, _, _, err := engine.ApplyOnce(cfg, guiReporter{a})
+				_, _, _, err := engine.ApplyOnceOpts(cfg, guiReporter{a}, engine.Options{
+					GitLevel: a.gitLevel(),
+				})
 				a.busy.Store(false)
 				if err != nil {
 					a.emitStatus("后台自愈: "+err.Error(), "err")
@@ -980,6 +1207,8 @@ func (a *App) startDeep(cfg *config.Config) error {
 	a.deepMu.Unlock()
 	a.deepOn.Store(true)
 	a.emitState()
+	// 命令行接管放到后台：要 fork git 子进程，绝不能挡住「开启」按钮的返回。
+	go a.syncCLIProxy()
 	return nil
 }
 
@@ -1022,6 +1251,14 @@ func (a *App) stopDeep() <-chan struct{} {
 	go func() {
 		defer close(done)
 		a.restoreSystemProxy(gen, target)
+	}()
+	// 命令行代理清理独立跑：它要 fork git 子进程（几十毫秒起），
+	// 绝不能拖慢「关闭已完成」的信号——否则用户点关闭会等出白屏，
+	// 退出流程的 watchdog 也会被它连累。清理本身幂等，晚一点无副作用。
+	go func() {
+		if err := executor.RemoveCLIProxy(); err != nil {
+			a.logf("撤销命令行代理失败: %v", err)
+		}
 	}()
 	return done
 }

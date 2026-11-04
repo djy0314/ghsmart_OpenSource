@@ -32,32 +32,68 @@ func readGitConfig(t *testing.T, p string) string {
 	return string(data)
 }
 
-// TestApplyGitWritesInsteadOf：ApplyGit 写入三条精确的 insteadOf 改写。
-func TestApplyGitWritesInsteadOf(t *testing.T) {
+// TestDefaultLevelNeverRewritesSSH 是 v1.0.8 的核心安全断言：
+// 默认档绝不能出现 git@github.com: 或 ssh:// 的改写——
+// 那会把用户的 git push 从 SSH 偷偷改道到 HTTPS。
+func TestDefaultLevelNeverRewritesSSH(t *testing.T) {
 	p := isolatedGit(t)
-	if err := ApplyGit(nil); err != nil {
+	if err := ApplyGit(GitRewriteGitOnly); err != nil {
 		t.Fatalf("ApplyGit 失败: %v", err)
 	}
 	got := readGitConfig(t, p)
-	for _, want := range gitInsteadOfValues {
-		if !strings.Contains(got, gitInsteadOfBase+"\n\t"+want) &&
-			!strings.Contains(got, want) {
+
+	for _, forbidden := range gitInsteadOfSSH {
+		if strings.Contains(got, forbidden) {
+			t.Fatalf("默认档不应写入 %q，实际配置:\n%s", forbidden, got)
+		}
+	}
+	if !strings.Contains(got, "git://github.com/") {
+		t.Fatalf("默认档应写入 git:// 改写，实际配置:\n%s", got)
+	}
+}
+
+// TestSSHLevelWritesAllThree：用户主动选择 HTTPS 模式时才写三条。
+func TestSSHLevelWritesAllThree(t *testing.T) {
+	p := isolatedGit(t)
+	if err := ApplyGit(GitRewriteSSH); err != nil {
+		t.Fatalf("ApplyGit 失败: %v", err)
+	}
+	got := readGitConfig(t, p)
+	for _, want := range allGitValues() {
+		if !strings.Contains(got, want) {
 			t.Fatalf("缺少 insteadOf 条目 %q，配置为:\n%s", want, got)
 		}
 	}
-	if !strings.Contains(got, "[url") || !strings.Contains(got, "https://github.com/") {
-		t.Fatalf("缺少 url 小节，配置为:\n%s", got)
+}
+
+// TestDowngradeRemovesSSHImmediately：从 HTTPS 模式切回默认档时，
+// SSH 两条必须被删掉——用户取消勾选后要能立刻恢复 SSH 推送。
+func TestDowngradeRemovesSSHImmediately(t *testing.T) {
+	p := isolatedGit(t)
+	if err := ApplyGit(GitRewriteSSH); err != nil {
+		t.Fatalf("升档失败: %v", err)
+	}
+	if err := ApplyGit(GitRewriteGitOnly); err != nil {
+		t.Fatalf("降档失败: %v", err)
+	}
+	got := readGitConfig(t, p)
+	for _, gone := range gitInsteadOfSSH {
+		if strings.Contains(got, gone) {
+			t.Fatalf("降档后 %q 仍残留:\n%s", gone, got)
+		}
+	}
+	if !strings.Contains(got, "git://github.com/") {
+		t.Fatalf("降档后默认档条目应保留:\n%s", got)
 	}
 }
 
 // TestApplyGitIdempotent：重复 ApplyGit 不产生重复条目。
 func TestApplyGitIdempotent(t *testing.T) {
 	p := isolatedGit(t)
-	if err := ApplyGit(nil); err != nil {
-		t.Fatalf("第一次 ApplyGit 失败: %v", err)
-	}
-	if err := ApplyGit(nil); err != nil {
-		t.Fatalf("第二次 ApplyGit 失败: %v", err)
+	for i := 0; i < 2; i++ {
+		if err := ApplyGit(GitRewriteSSH); err != nil {
+			t.Fatalf("第 %d 次 ApplyGit 失败: %v", i+1, err)
+		}
 	}
 	got := readGitConfig(t, p)
 	if n := strings.Count(got, "git@github.com:"); n != 1 {
@@ -65,11 +101,11 @@ func TestApplyGitIdempotent(t *testing.T) {
 	}
 }
 
-// TestRemoveGitOnlyRemovesOwnValues：清理只删 ghsmart 的三条值，
+// TestRemoveGitOnlyRemovesOwnValues：清理只删 ghsmart 的值，
 // 用户自己配置的 insteadOf 原样保留。
 func TestRemoveGitOnlyRemovesOwnValues(t *testing.T) {
 	p := isolatedGit(t)
-	if err := ApplyGit(nil); err != nil {
+	if err := ApplyGit(GitRewriteSSH); err != nil {
 		t.Fatalf("ApplyGit 失败: %v", err)
 	}
 	// 模拟用户自己的一条 insteadOf（不同 base，ghsmart 不应触碰）
@@ -78,13 +114,13 @@ func TestRemoveGitOnlyRemovesOwnValues(t *testing.T) {
 		t.Fatalf("预置用户配置失败: %v %s", err, out)
 	}
 
-	if err := RemoveGit(nil); err != nil {
+	if err := RemoveGit(); err != nil {
 		t.Fatalf("RemoveGit 失败: %v", err)
 	}
 
 	got := readGitConfig(t, p)
-	for _, v := range gitInsteadOfValues {
-		if strings.Contains(got, "\t"+v+"\n") || strings.Contains(got, "\t"+v) {
+	for _, v := range allGitValues() {
+		if strings.Contains(got, "\t"+v) {
 			t.Fatalf("ghsmart 的 insteadOf %q 未被清理:\n%s", v, got)
 		}
 	}
@@ -96,13 +132,32 @@ func TestRemoveGitOnlyRemovesOwnValues(t *testing.T) {
 // TestRemoveGitIdempotent：没有 ghsmart 条目时 RemoveGit 静默成功。
 func TestRemoveGitIdempotent(t *testing.T) {
 	p := isolatedGit(t)
-	if err := RemoveGit(nil); err != nil {
+	if err := RemoveGit(); err != nil {
 		t.Fatalf("空配置 RemoveGit 不应报错: %v", err)
 	}
-	if err := RemoveGit(nil); err != nil {
+	if err := RemoveGit(); err != nil {
 		t.Fatalf("重复 RemoveGit 不应报错: %v", err)
 	}
 	if got := readGitConfig(t, p); got != "" {
 		t.Fatalf("空配置清理后应为空文件，实际:\n%s", got)
+	}
+}
+
+// TestNormalizeGitRewrite：非法/空档位一律回落到最安全的默认档。
+func TestNormalizeGitRewrite(t *testing.T) {
+	cases := map[string]string{
+		"":                 GitRewriteGitOnly,
+		"   ":              GitRewriteGitOnly,
+		"ssh":              GitRewriteSSH,
+		"SSH":              GitRewriteSSH,
+		" ssh ":            GitRewriteSSH,
+		"all":              GitRewriteGitOnly, // 未知值不许放大权限
+		"git@github.com":   GitRewriteGitOnly,
+		"https":            GitRewriteGitOnly,
+	}
+	for in, want := range cases {
+		if got := NormalizeGitRewrite(in); got != want {
+			t.Fatalf("NormalizeGitRewrite(%q) = %q，期望 %q", in, got, want)
+		}
 	}
 }

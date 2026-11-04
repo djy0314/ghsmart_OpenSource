@@ -45,6 +45,9 @@ func main() {
 	}
 
 	app := NewApp()
+	// --silent：由「开机自启」（计划任务或 Run 键）带起时使用。
+	// 效果 = 窗口不弹出、直接进托盘，但状态恢复逻辑与手动打开完全一致。
+	app.silent = hasArg(os.Args[1:], "--silent")
 
 	// 作业对象：主进程一死，作业内所有辅助进程被操作系统立刻终止，
 	// 不会留下占着端口的孤儿。守卫进程刻意不加入作业（它要活到最后收尾）。
@@ -64,6 +67,9 @@ func main() {
 		Height:    720,
 		MinWidth:  620,
 		MinHeight: 600,
+		// 静默自启时不显示主窗口，直接常驻托盘。
+		// 用户点托盘「显示主界面」随时能看见它——不是偷偷在后台跑。
+		StartHidden: app.silent,
 		// 关键：WebView2 底色必须与页面 --bg 一致（#0f172a）。
 		// 缺省是白色，界面批量重绘（表格插入/弹窗显隐）时会短暂露出白底，
 		// 表现为用户看到的「界面一闪一下」。
@@ -129,6 +135,16 @@ func scheduleSelfQuit(a *App) {
 		time.Sleep(time.Duration(n) * time.Millisecond)
 		a.QuitApp()
 	}()
+}
+
+// hasArg 判断命令行参数里是否有某个开关（形如 --silent）。
+func hasArg(args []string, want string) bool {
+	for _, a := range args {
+		if a == want {
+			return true
+		}
+	}
+	return false
 }
 
 // onTrayReady 构建托盘图标与右键菜单。

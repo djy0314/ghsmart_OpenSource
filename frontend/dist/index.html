@@ -172,6 +172,27 @@
     .pro-box.healing .spin { display: inline; }
     .pro-box .label { white-space: nowrap; }
 
+    /* 无感设置面板：三项都可选，默认全关，开了才更省心 */
+    .opt-panel {
+      margin-top: 12px; padding: 10px 14px;
+      background: var(--panel2); border: 1px solid var(--line); border-radius: 10px;
+    }
+    .opt-panel .opt-head {
+      display: flex; align-items: baseline; gap: 8px;
+      font-size: 12.5px; color: var(--dim); margin-bottom: 4px;
+    }
+    .opt-panel .opt-head span { font-size: 11px; opacity: .75; }
+    .opt-panel .pro-box {
+      background: transparent; border: none; padding: 7px 0; border-radius: 0;
+    }
+    .opt-panel .pro-box + .pro-box { border-top: 1px dashed var(--line); }
+    .opt-note {
+      display: none; margin-top: 8px; padding: 8px 10px; border-radius: 8px;
+      font-size: 11.5px; line-height: 1.6; color: #fbbf24;
+      background: rgba(251,191,36,.08); border: 1px solid rgba(251,191,36,.30);
+    }
+    .opt-note.show { display: block; }
+
     /* 清除授权：右上角极小的文本按钮 */
     #clear-lic {
       padding: 2px 8px; margin-left: 6px; font-size: 10px; cursor: pointer;
@@ -185,7 +206,7 @@
   <header>
     <svg class="logo" viewBox="0 0 512 512"><rect x="16" y="16" width="480" height="480" rx="96" fill="#0f172a" stroke="#38bdf8" stroke-width="12"/><polygon points="300,60 170,270 250,270 200,452 360,230 270,230 330,60" fill="#34d399"/></svg>
     <h1>ghsmart</h1>
-    <span class="ver" id="ver-text">Free v1.0.7 · 纯本地加速</span>
+    <span class="ver" id="ver-text">Free v1.0.8 · 纯本地加速</span>
     <button id="clear-lic" type="button" title="删除本地授权文件并回到 Free 状态（测试用）">清除授权</button>
   </header>
 
@@ -220,6 +241,27 @@
           <span class="lock">🔒</span>
         </div>
       </div>
+    </div>
+
+    <!-- 无感设置：默认全关；开一次就忘掉，每一项都能在「一键还原网络」里撤销 -->
+    <div class="opt-panel">
+      <div class="opt-head">无感设置<span>可选 · 默认关闭 · 全部可一键还原</span></div>
+      <div class="pro-box" id="autostart-toggle" title="开机自动以管理员身份启动并隐藏到托盘。使用计划任务注册，不会弹 UAC">
+        <div class="switch"></div>
+        <span class="label">🚀 开机自启（静默到托盘）</span>
+        <span class="state-txt" id="autostart-state"></span>
+      </div>
+      <div class="pro-box" id="cliproxy-toggle" title="让 gh / curl 等不读系统代理的命令行工具也走本地代理。开启后会写入用户级 HTTP_PROXY / HTTPS_PROXY；检测到您已有代理设置时自动跳过，不动您的配置">
+        <div class="switch"></div>
+        <span class="label">⌨️ 命令行加速（gh / curl）</span>
+        <span class="state-txt" id="cli-state"></span>
+      </div>
+      <div class="pro-box" id="githttps-toggle" title="把 git@github.com: 与 ssh:// 改写成 HTTPS。注意：这会改变 git push 的通道，用 SSH key 推送的用户请勿开启">
+        <div class="switch"></div>
+        <span class="label">🔁 Git 加速（HTTPS 模式）</span>
+        <span class="state-txt" id="git-state"></span>
+      </div>
+      <div class="opt-note" id="opt-note"></div>
     </div>
   </main>
 
@@ -345,7 +387,7 @@
         } else {
           deep.title = "Pro 功能：本地 TLS 分片代理，绕过 SNI 阻断（无需安装任何证书）。连不上会自动适配，不用做任何设置";
         }
-        if (verTxt) verTxt.textContent = "Pro v1.0.7 · 已授权";
+        if (verTxt) verTxt.textContent = "Pro v1.0.8 · 已授权";
       } else {
         box.classList.remove("unlocked", "healing");
         deep.classList.remove("unlocked", "on");
@@ -355,7 +397,46 @@
         if (deepLock) deepLock.textContent = "🔒";
         if (healTxt) healTxt.textContent = "";
         if (deepTxt) deepTxt.textContent = "";
-        if (verTxt) verTxt.textContent = "Free v1.0.7 · 纯本地加速";
+        if (verTxt) verTxt.textContent = "Free v1.0.8 · 纯本地加速";
+      }
+      renderOpts(s);
+    }
+
+    // ===== 无感设置三项的渲染 =====
+    // 与 renderState 同源（后端返回值 / engine:state 事件），
+    // 绝不在前端本地猜测开关状态——否则后端失败时界面会撒谎。
+    function renderOpts(s) {
+      const as = $("autostart-toggle");
+      const cp = $("cliproxy-toggle");
+      const gh = $("githttps-toggle");
+      if (!as || !cp || !gh) return;
+
+      as.classList.toggle("on", !!s.autoStart);
+      const asTxt = $("autostart-state");
+      if (asTxt) {
+        // 计划任务 = 静默；降级到注册表启动项时必须明说会弹 UAC，不能骗人
+        asTxt.textContent = !s.autoStart ? "已关闭"
+          : (s.autoStartMode === "task" ? "已开启" : "已开启（需 UAC）");
+      }
+      if (s.autoStartDetail) as.title = s.autoStartDetail;
+
+      cp.classList.toggle("on", !!s.cliProxyEnv);
+      const cpTxt = $("cli-state");
+      if (cpTxt) cpTxt.textContent = s.cliProxyEnv ? "已开启" : "已关闭";
+
+      gh.classList.toggle("on", !!s.gitHTTPS);
+      const ghTxt = $("git-state");
+      if (ghTxt) ghTxt.textContent = s.gitHTTPS ? "已开启" : "已关闭";
+
+      // HTTPS 模式会改 push 通道，必须持续可见地提醒，而不是只在打开时弹一次
+      const note = $("opt-note");
+      if (note) {
+        if (s.gitHTTPS) {
+          note.textContent = "⚠️ HTTPS 模式已开启：git@github.com: 与 ssh:// 的地址会被自动改写成 HTTPS，SSH key 推送会失效（改为凭据登录）。关闭本项后立刻恢复，无需重启。";
+          note.classList.add("show");
+        } else {
+          note.classList.remove("show");
+        }
       }
     }
 
@@ -507,6 +588,32 @@
           + "「一键智能加速」（Hosts 模式）不受影响，可正常使用。", "warn");
       });
     })();
+
+    // ===== 无感设置：三个开关 =====
+    // 统一流程：先禁用防连点 → 调后端 → 用返回值渲染 → 恢复。
+    // 任何异常都用 toast 明说，不静默失败（开关点了没反应最让人抓狂）。
+    async function toggleOpt(el, call) {
+      if (!el) return;
+      const cur = el.classList.contains("on");
+      el.style.pointerEvents = "none";
+      try {
+        const st = await call(!cur);
+        renderState(st);
+        renderOpts(st);
+      } catch (e) {
+        const msg = (e && e.message) ? e.message : String(e);
+        toast("⚠️ " + msg, "err");
+        if (statusText) statusText.textContent = msg;
+      } finally {
+        el.style.pointerEvents = "";
+      }
+    }
+    $("autostart-toggle").addEventListener("click", () =>
+      toggleOpt($("autostart-toggle"), (on) => app.SetAutoStart(on)));
+    $("cliproxy-toggle").addEventListener("click", () =>
+      toggleOpt($("cliproxy-toggle"), (on) => app.SetCLIProxyEnv(on)));
+    $("githttps-toggle").addEventListener("click", () =>
+      toggleOpt($("githttps-toggle"), (on) => app.SetGitHTTPS(on)));
 
     // ===== 启动初始化 =====
     app.IsElevated().then((v) => { if (v) $("admin-badge").style.display = "inline"; });

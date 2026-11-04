@@ -19,7 +19,13 @@ export function RemoveHosts():Promise<void>;
 
 export function SetAutoHeal(arg1:boolean):Promise<Record<string, any>>;
 
+export function SetAutoStart(arg1:boolean):Promise<Record<string, any>>;
+
+export function SetCLIProxyEnv(arg1:boolean):Promise<Record<string, any>>;
+
 export function SetDeepAccel(arg1:boolean):Promise<Record<string, any>>;
+
+export function SetGitHTTPS(arg1:boolean):Promise<Record<string, any>>;
 
 export function Shutdown():Promise<void>;
 

@@ -230,6 +230,13 @@ type Options struct {
 	// 用于「加速已生效」的秒级通知：主域名一通，用户马上就能打开网页。
 	// 回调运行在主域名的处理协程里，不得阻塞太久。
 	OnPrimary func(entries map[string]string)
+
+	// GitLevel 是 git 协议改写档位（见 executor.GitRewrite*）。
+	//
+	// 零值等价于默认档：只处理已停用的 git:// 协议，**不改写 SSH**。
+	// 这是 v1.0.8 的安全默认——旧版无条件把 git@github.com: 改写成 HTTPS，
+	// 会让用 SSH key 推送的用户 push 失败，属于不该有的破坏性默认值。
+	GitLevel string
 }
 
 // RunApply 执行一轮「解析 -> 探测 -> 决策 -> 写 Hosts」。
@@ -344,10 +351,11 @@ func RunApplyOpts(ctx context.Context, cfg *config.Config, r Reporter, opts Opti
 	if err := executor.ApplyHosts(entries); err != nil {
 		return entries, lines, restricted, fmt.Errorf("写入 Hosts 失败（请以管理员身份运行）: %w", err)
 	}
-	// git 加速：写 Hosts 成功后同步应用 insteadOf 改写（SSH/git 协议 -> HTTPS）。
+	// git 加速：写 Hosts 成功后按档位同步应用 insteadOf 改写。
 	// 失败不致命（未装 git 等），只告警，不影响主流程。
+	// 档位由调用方决定（默认档不改写 SSH，见 Options.GitLevel）。
 	if len(entries) > 0 {
-		if err := executor.ApplyGit(nil); err != nil {
+		if err := executor.ApplyGit(opts.GitLevel); err != nil {
 			r.Warn(err.Error())
 		}
 	}
@@ -355,8 +363,8 @@ func RunApplyOpts(ctx context.Context, cfg *config.Config, r Reporter, opts Opti
 }
 
 // RestoreHosts 是「安全还原」的统一入口（GUI 与 CLI 共用）：
-// 删除 Hosts 区块、还原被注释的冲突行、清理 git insteadOf 配置。
-// git 清理失败不致命，只告警。
+// 删除 Hosts 区块、还原被注释的冲突行、清理 git 改写与命令行代理。
+// 后两项清理失败不致命，只告警。
 func RestoreHosts(r Reporter) error {
 	if r == nil {
 		r = NopReporter{}
@@ -364,8 +372,13 @@ func RestoreHosts(r Reporter) error {
 	if err := executor.RemoveHosts(); err != nil {
 		return err
 	}
-	if err := executor.RemoveGit(nil); err != nil {
+	if err := executor.RemoveGit(); err != nil {
 		r.Warn("git insteadOf 清理失败: " + err.Error())
+	}
+	// 命令行代理（git 按 URL 代理 + 用户级环境变量）一并撤销：
+	// 「一键还原网络」的语义就是把我留下的一切痕迹清干净。
+	if err := executor.RemoveCLIProxy(); err != nil {
+		r.Warn("命令行代理清理失败: " + err.Error())
 	}
 	return nil
 }

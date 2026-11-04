@@ -1,15 +1,23 @@
-// Package executor 内的 Git 配置实现（Phase 2）。
+// Package executor 内的 Git 协议配置实现。
 //
-// ghsmart 是纯本地加速，不走任何镜像/中转；git 侧的加速点是：
-// 国内对 GitHub 的 SSH（22 端口）与 git://（9418 端口）经常不可达，
-// 而 HTTPS 走的正是 Hosts 优选过的 IP。因此写入三条 insteadOf 改写，
-// 把 SSH/git 协议的 clone/fetch 自动改走 HTTPS：
+// # v1.0.8 重构背景（重要）
 //
-//	git@github.com:owner/repo.git      -> https://github.com/owner/repo.git
-//	ssh://git@github.com/owner/repo    -> https://github.com/owner/repo
-//	git://github.com/owner/repo.git    -> https://github.com/owner/repo.git
+// 旧版无条件把 git@github.com: 与 ssh://git@github.com/ 全量改写成 HTTPS。
+// 对「用 SSH key 推送」的用户这是破坏性的：insteadOf 是 URL 级改写，
+// **push 同样生效**，所以开一次加速后 git push 会突然改走 HTTPS，
+// 轻则弹凭据框、重则 403 或者推到没权限的账号；而且是全局配置，
+// 用户几乎不可能想到是一个加速器改的。
 //
-// 写入与清理都只针对下面这三个「精确值」，绝不增删用户自己的其他配置。
+// 新策略按档位管理，默认档对 SSH 零影响：
+//
+//	GitRewriteGitOnly（默认）：只改写 git://github.com/
+//	    GitHub 早在 2021 年就停用了 git:// 协议，这条实际上是零风险的
+//	    历史兼容，不会改变任何人的 SSH / HTTPS 工作流。
+//	GitRewriteSSH（可选）：用户显式勾选「Git 加速（HTTPS 模式）」后，
+//	    才追加 git@github.com: 与 ssh://git@github.com/ 两条改写。
+//
+// 清理永远按「所有已知精确值」全量撤销，绝不留半档状态（换档、关功能、
+// 一键还原网络三条路径都走同一个 RemoveGit）。
 package executor
 
 import (
@@ -21,24 +29,72 @@ import (
 // gitInsteadOfBase 是 insteadOf 写入的目标 base。
 const gitInsteadOfBase = "url.https://github.com/.insteadOf"
 
-// GitSettings 保留原占位接口的参数类型（Phase 1 定义），当前实现不使用其内容。
-type GitSettings map[string]string
+// Git 加速档位。
+const (
+	// GitRewriteGitOnly 默认档：只处理已停用的 git:// 协议，对 SSH 零影响。
+	GitRewriteGitOnly = "git"
+	// GitRewriteSSH 用户显式选择：额外把 SSH 与 ssh:// 改写成 HTTPS。
+	GitRewriteSSH = "ssh"
+)
 
-// gitInsteadOfValues 是 ghsmart 管理的三条改写来源（精确值，用于幂等写入与精确清理）。
-var gitInsteadOfValues = []string{
-	"git@github.com:",
-	"ssh://git@github.com/",
+// gitInsteadOfGitOnly 是默认档管理的改写来源。
+var gitInsteadOfGitOnly = []string{
 	"git://github.com/",
 }
 
-// CommentPrefix 之外的又一个管理标记：git 配置无注释能力，靠「精确值」圈定管理范围。
-// ApplyGit 幂等写入三条 insteadOf（已存在则跳过）。
+// gitInsteadOfSSH 是「HTTPS 模式」额外管理的改写来源。
+// 注意 git@github.com: 落在 push 路径上——这正是必须让用户主动勾选的原因。
+var gitInsteadOfSSH = []string{
+	"git@github.com:",
+	"ssh://git@github.com/",
+}
+
+// NormalizeGitRewrite 把外部传入的档位收敛成合法值，非法值回落到默认档。
+// 默认档是「最安全」的那一个，任何意外输入都不该让 SSH 被改写。
+func NormalizeGitRewrite(level string) string {
+	if strings.EqualFold(strings.TrimSpace(level), GitRewriteSSH) {
+		return GitRewriteSSH
+	}
+	return GitRewriteGitOnly
+}
+
+// gitValuesFor 返回某档位应当存在的全部改写值。
+func gitValuesFor(level string) []string {
+	vals := append([]string(nil), gitInsteadOfGitOnly...)
+	if NormalizeGitRewrite(level) == GitRewriteSSH {
+		vals = append(vals, gitInsteadOfSSH...)
+	}
+	return vals
+}
+
+// allGitValues 返回我们可能写过的全部值（清理用，必须覆盖所有档位）。
+func allGitValues() []string {
+	vals := append([]string(nil), gitInsteadOfGitOnly...)
+	vals = append(vals, gitInsteadOfSSH...)
+	return vals
+}
+
+// ApplyGit 按档位幂等写入 insteadOf 改写。
+//
+// 升档（git -> ssh）只追加；降档（ssh -> git）会先把多出来的 SSH 两条删掉，
+// 保证「用户取消勾选」后立即恢复 SSH 推送能力，不需要重启。
 // git 未安装时返回可读错误，由调用方决定降级（加速主流程不依赖 git）。
-func ApplyGit(_ GitSettings) error {
+func ApplyGit(level string) error {
 	if _, err := exec.LookPath("git"); err != nil {
 		return fmt.Errorf("未检测到 git，跳过 git 加速配置: %w", err)
 	}
-	for _, v := range gitInsteadOfValues {
+	level = NormalizeGitRewrite(level)
+
+	// 降档：SSH 档不再需要，先精确撤销那两条
+	if level != GitRewriteSSH {
+		for _, v := range gitInsteadOfSSH {
+			if err := removeGitEntry(v); err != nil {
+				return err
+			}
+		}
+	}
+
+	for _, v := range gitValuesFor(level) {
 		exists, err := gitConfigHas(gitInsteadOfBase, v)
 		if err != nil {
 			return fmt.Errorf("读取 git 配置失败: %w", err)
@@ -54,24 +110,35 @@ func ApplyGit(_ GitSettings) error {
 	return nil
 }
 
-// RemoveGit 精确清理 ghsmart 写入的三条 insteadOf。
-// 使用 --fixed-value 做字面量匹配（git >= 2.30），只删 ghsmart 的值，
-// 用户手工配置的其他 insteadOf 一律不动；值不存在时静默跳过。
-func RemoveGit(_ GitSettings) error {
+// RemoveGit 精确清理所有档位可能写入的 insteadOf 条目（幂等）。
+//
+// 这是「一键还原网络」与「关闭 Git 加速」共用的清理入口：不管用户之前
+// 选的是哪一档，三条值全部按字面量精确删除，用户手工配置的其他
+// insteadOf 一律不动。
+func RemoveGit() error {
 	if _, err := exec.LookPath("git"); err != nil {
 		return nil // 没有 git 就没有可清理的东西，不算错误
 	}
-	for _, v := range gitInsteadOfValues {
-		exists, err := gitConfigHas(gitInsteadOfBase, v)
-		if err != nil {
-			return fmt.Errorf("读取 git 配置失败: %w", err)
+	for _, v := range allGitValues() {
+		if err := removeGitEntry(v); err != nil {
+			return err
 		}
-		if !exists {
-			continue
-		}
-		if out, err := runGit("config", "--global", "--unset-all", "--fixed-value", gitInsteadOfBase, v); err != nil {
-			return fmt.Errorf("清理 git insteadOf 失败 (%s): %w: %s", v, err, strings.TrimSpace(out))
-		}
+	}
+	return nil
+}
+
+// removeGitEntry 删除单条 insteadOf 值（不存在时静默跳过）。
+func removeGitEntry(value string) error {
+	exists, err := gitConfigHas(gitInsteadOfBase, value)
+	if err != nil {
+		return fmt.Errorf("读取 git 配置失败: %w", err)
+	}
+	if !exists {
+		return nil
+	}
+	// --fixed-value 做字面量匹配（git >= 2.30），只删我们写的那一条
+	if out, err := runGit("config", "--global", "--unset-all", "--fixed-value", gitInsteadOfBase, value); err != nil {
+		return fmt.Errorf("清理 git insteadOf 失败 (%s): %w: %s", value, err, strings.TrimSpace(out))
 	}
 	return nil
 }

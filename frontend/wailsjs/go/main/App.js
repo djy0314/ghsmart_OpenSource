@@ -38,8 +38,20 @@ export function SetAutoHeal(arg1) {
   return window['go']['main']['App']['SetAutoHeal'](arg1);
 }
 
+export function SetAutoStart(arg1) {
+  return window['go']['main']['App']['SetAutoStart'](arg1);
+}
+
+export function SetCLIProxyEnv(arg1) {
+  return window['go']['main']['App']['SetCLIProxyEnv'](arg1);
+}
+
 export function SetDeepAccel(arg1) {
   return window['go']['main']['App']['SetDeepAccel'](arg1);
+}
+
+export function SetGitHTTPS(arg1) {
+  return window['go']['main']['App']['SetGitHTTPS'](arg1);
 }
 
 export function Shutdown() {
