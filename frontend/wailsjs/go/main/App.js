@@ -6,6 +6,10 @@ export function ActivatePro(arg1) {
   return window['go']['main']['App']['ActivatePro'](arg1);
 }
 
+export function CheckUpdate() {
+  return window['go']['main']['App']['CheckUpdate']();
+}
+
 export function ClearLicense() {
   return window['go']['main']['App']['ClearLicense']();
 }
@@ -24,6 +28,10 @@ export function GetProState() {
 
 export function IsElevated() {
   return window['go']['main']['App']['IsElevated']();
+}
+
+export function OpenReleasePage() {
+  return window['go']['main']['App']['OpenReleasePage']();
 }
 
 export function QuitApp() {
@@ -56,6 +64,10 @@ export function SetGitHTTPS(arg1) {
 
 export function Shutdown() {
   return window['go']['main']['App']['Shutdown']();
+}
+
+export function SkipUpdate() {
+  return window['go']['main']['App']['SkipUpdate']();
 }
 
 export function StartApply() {

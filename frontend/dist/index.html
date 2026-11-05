@@ -82,6 +82,29 @@
       background: rgba(148,163,184,.10); border: 1px solid rgba(148,163,184,.35);
     }
     #hint-bar.show { display: block; }
+
+    /* 共存冲突提示：比 hint-bar 更醒目，因为这是「我们动了用户的东西」 */
+    #conflict-bar {
+      display: none; margin: 8px 20px 0; padding: 8px 12px; border-radius: 8px;
+      font-size: 12.5px; line-height: 1.55; cursor: pointer;
+      color: #fcd34d; background: rgba(251,191,36,.10); border: 1px solid rgba(251,191,36,.45);
+    }
+    #conflict-bar.show { display: block; }
+
+    /* 新版本徽标：绿色小药丸，只在真有更新时出现 */
+    #update-wrap { display: none; align-items: center; gap: 4px; margin-left: 8px; }
+    #update-wrap.show { display: inline-flex; }
+    #update-badge {
+      padding: 2px 9px; font-size: 10.5px; font-weight: 600; cursor: pointer;
+      color: #04202b; background: #34d399; border: none; border-radius: 999px;
+    }
+    #update-badge:hover { filter: brightness(1.08); }
+    #update-skip {
+      width: 16px; height: 16px; padding: 0; font-size: 12px; line-height: 1;
+      cursor: pointer; color: var(--dim); background: transparent;
+      border: 1px solid var(--line); border-radius: 50%;
+    }
+    #update-skip:hover { color: var(--err); border-color: var(--err); }
     .pro-box {
       flex: 1; display: flex; align-items: center; gap: 10px; padding: 12px 14px;
       background: var(--panel2); border: 1px solid var(--line); border-radius: 10px; cursor: pointer;
@@ -206,7 +229,12 @@
   <header>
     <svg class="logo" viewBox="0 0 512 512"><rect x="16" y="16" width="480" height="480" rx="96" fill="#0f172a" stroke="#38bdf8" stroke-width="12"/><polygon points="300,60 170,270 250,270 200,452 360,230 270,230 330,60" fill="#34d399"/></svg>
     <h1>ghsmart</h1>
-    <span class="ver" id="ver-text">Free v1.0.8 · 纯本地加速</span>
+    <span class="ver" id="ver-text">Free v1.0.9 · 纯本地加速</span>
+    <!-- 有新版本时才出现：点徽标去下载页，点 × 表示「这个版本先不管」 -->
+    <span id="update-wrap">
+      <button id="update-badge" type="button" title="发现新版本，点击查看下载页">新版本</button>
+      <button id="update-skip" type="button" title="不再提示这个版本">×</button>
+    </span>
     <button id="clear-lic" type="button" title="删除本地授权文件并回到 Free 状态（测试用）">清除授权</button>
   </header>
 
@@ -216,6 +244,8 @@
     <span id="applied-info"></span>
   </div>
   <div id="hint-bar">当前网络可能受企业策略限制，建议使用一键智能加速</div>
+  <!-- 共存冲突：我们为了自己生效，压住了别的加速工具的记录——必须说出来 -->
+  <div id="conflict-bar" title="点击关闭此提示"></div>
 
   <main>
     <!-- 核心操作区 -->
@@ -387,7 +417,7 @@
         } else {
           deep.title = "Pro 功能：本地 TLS 分片代理，绕过 SNI 阻断（无需安装任何证书）。连不上会自动适配，不用做任何设置";
         }
-        if (verTxt) verTxt.textContent = "Pro v1.0.8 · 已授权";
+        if (verTxt) verTxt.textContent = "Pro " + verLabel(s) + " · 已授权";
       } else {
         box.classList.remove("unlocked", "healing");
         deep.classList.remove("unlocked", "on");
@@ -397,9 +427,34 @@
         if (deepLock) deepLock.textContent = "🔒";
         if (healTxt) healTxt.textContent = "";
         if (deepTxt) deepTxt.textContent = "";
-        if (verTxt) verTxt.textContent = "Free v1.0.8 · 纯本地加速";
+        if (verTxt) verTxt.textContent = "Free " + verLabel(s) + " · 纯本地加速";
       }
       renderOpts(s);
+      renderUpdate(s);
+    }
+
+    // 版本号由后端给（s.version）。前端不再写死——
+    // 写死的后果是发版时漏改一处，界面就开始撒谎。
+    function verLabel(s) {
+      const v = s && s.version ? String(s.version) : "";
+      return v ? "v" + v : "v—";
+    }
+
+    // 有新版本才显示徽标；后端说没有就收起来（不能残留上次的提示）
+    function renderUpdate(s) {
+      const wrap = $("update-wrap");
+      if (!wrap) return;
+      const has = !!(s && s.updateAvailable);
+      wrap.classList.toggle("show", has);
+      if (!has) return;
+      const badge = $("update-badge");
+      if (badge) {
+        badge.textContent = "新版本 " + (s.tag || s.latest || "");
+        // 更新说明放 title：客户想知道改了什么，但不想在标题栏读长文
+        const first = (s.notes || "").split("\n").filter((x) => x.trim())[0] || "";
+        badge.title = first ? ("更新说明：" + first + "\n点击查看下载页")
+          : "发现新版本，点击查看下载页";
+      }
     }
 
     // ===== 无感设置三项的渲染 =====
@@ -587,6 +642,22 @@
         toast("🛡 检测到当前网络环境（如公司 VPN）拦截了加速流量，已为您自动关闭深度加速，防止网页卡死。"
           + "「一键智能加速」（Hosts 模式）不受影响，可正常使用。", "warn");
       });
+
+      // 发现新版本：只提示，不自动下载、不静默升级（要管理员权限的工具不适合自动更新）
+      EventsOn("app:update", (s) => renderUpdate(s));
+
+      // Hosts 共存冲突：后端压住了另一款加速工具的记录，必须让用户知道
+      EventsOn("engine:hosts-conflict", (d) => {
+        const bar = $("conflict-bar");
+        if (bar && d && d.message) {
+          bar.textContent = d.message;
+          bar.classList.add("show");
+        }
+        // toast 放短版：长文案在右下角会溢出，完整说明已经在常驻条里
+        if (d && (d.commented > 0 || (d.tools || []).length > 0)) {
+          toast("⚠️ 检测到其他加速工具的记录，已临时注释以免互相抢（详见上方提示）", "warn");
+        }
+      });
     })();
 
     // ===== 无感设置：三个开关 =====
@@ -614,6 +685,31 @@
       toggleOpt($("cliproxy-toggle"), (on) => app.SetCLIProxyEnv(on)));
     $("githttps-toggle").addEventListener("click", () =>
       toggleOpt($("githttps-toggle"), (on) => app.SetGitHTTPS(on)));
+
+    // ===== 新版本徽标 =====
+    // 点徽标 = 去下载页（客户想要的下一步）；点 × = 这个版本先不管（持久记住）
+    $("update-badge").addEventListener("click", async (e) => {
+      e.stopPropagation();
+      try {
+        await app.OpenReleasePage();
+        toast("已在浏览器打开下载页", "ok");
+      } catch (err) {
+        toast("打开下载页失败：" + ((err && err.message) || err), "err");
+      }
+    });
+    $("update-skip").addEventListener("click", async (e) => {
+      e.stopPropagation();
+      try {
+        const s = await app.SkipUpdate();
+        renderUpdate(s); // 用后端返回值收徽标，不在前端猜
+        toast("已跳过这个版本，之后不再提示", "ok");
+      } catch (err) {
+        toast(String((err && err.message) || err), "err");
+      }
+    });
+    // 冲突提示条：客户看完点一下就收起，不用留一个关不掉的黄条
+    $("conflict-bar").addEventListener("click", () =>
+      $("conflict-bar").classList.remove("show"));
 
     // ===== 启动初始化 =====
     app.IsElevated().then((v) => { if (v) $("admin-badge").style.display = "inline"; });

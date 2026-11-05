@@ -154,9 +154,22 @@ func lineDomains(line string) []string {
 // （Windows hosts 首条匹配优先，不注释会覆盖区块里的加速 IP）。
 // 已是注释的行不处理，天然幂等、绝不双重注释。
 func commentOutConflicts(content string, domains map[string]struct{}) string {
+	out, _ := commentOutConflictsReport(content, domains)
+	return out
+}
+
+// commentOutConflictsReport 是 commentOutConflicts 的带报告版本：
+// 额外返回被注释掉的行（去重后限量），供界面如实告知用户「动了什么」。
+//
+// 为什么要报告：这些行往往不是用户手写的，而是**另一款加速工具**写的
+// （Watt Toolkit / FastGithub / GitHub520 等）。以前的实现默默把它们注释掉，
+// 用户完全不知道——于是「装了两款加速器，其中一款突然不灵了」这种事
+// 永远查不出原因，最后两边都被骂。
+func commentOutConflictsReport(content string, domains map[string]struct{}) (string, []string) {
 	if len(domains) == 0 {
-		return content
+		return content, nil
 	}
+	var hits []string
 	lines := strings.Split(content, "\n")
 	for i, line := range lines {
 		trimmed := strings.TrimSpace(line)
@@ -166,11 +179,12 @@ func commentOutConflicts(content string, domains map[string]struct{}) string {
 		for _, d := range lineDomains(trimmed) {
 			if _, hit := domains[d]; hit {
 				lines[i] = CommentPrefix + line
+				hits = append(hits, trimmed)
 				break
 			}
 		}
 	}
-	return strings.Join(lines, "\n")
+	return strings.Join(lines, "\n"), hits
 }
 
 // restoreCommented 把 ghsmart 注释过的用户行原样恢复（去掉前缀）。
@@ -217,17 +231,29 @@ func readHostsBlockFrom(path string) (map[string]string, error) {
 // ApplyHosts 把 entries（域名 -> IP）写入系统 Hosts 的 ghsmart 区块，
 // 绝不触碰区块之外的用户内容。写入前先备份，写入后刷新 DNS 缓存。
 func ApplyHosts(entries map[string]string) error {
+	_, err := ApplyHostsReport(entries)
+	return err
+}
+
+// ApplyHostsReport 与 ApplyHosts 相同，但额外返回本次对区块外内容的影响
+// （注释掉了几行冲突记录、检测到哪些其他加速工具）。
+//
+// 调用方应当在 Commented > 0 时提示用户：
+// 我们为了让自己生效，压住了别人的记录，这件事必须让用户知道。
+func ApplyHostsReport(entries map[string]string) (HostsReport, error) {
+	var rep HostsReport
 	backup, err := backupPath()
 	if err != nil {
-		return err
+		return rep, err
 	}
-	if err := mutateHosts(HostsPath(), backup, entries); err != nil {
-		return err
+	rep, err = mutateHostsReport(HostsPath(), backup, entries)
+	if err != nil {
+		return rep, err
 	}
 	if err := FlushDNS(); err != nil {
 		fmt.Fprintf(os.Stderr, "警告: 刷新 DNS 缓存失败: %v\n", err)
 	}
-	return nil
+	return rep, nil
 }
 
 // RemoveHosts 删除系统 Hosts 中的 ghsmart 区块并刷新 DNS 缓存。
@@ -255,49 +281,132 @@ func backupPath() (string, error) {
 	return filepath.Join(dir, "hosts.bak"), nil
 }
 
+// HostsReport 描述一次写入对「区块外内容」的影响，供界面如实告知用户。
+//
+// 这个结构存在的理由：hosts 加速工具之间会抢同一批域名。ghsmart 写入前必须
+// 把冲突行注释掉（否则 Windows「首条匹配优先」会让自己的记录失效），
+// 但**不能默默做**——用户需要知道自己的另一款工具被压住了，否则
+// 「装了两个加速器，其中一个突然失效」永远查不出原因。
+type HostsReport struct {
+	// Commented 是本次被注释掉的区块外冲突行数（0 表示没碰任何用户内容）。
+	Commented int `json:"commented"`
+	// CommentedLines 是被注释行的样本（最多 5 条，每条已截断）。
+	CommentedLines []string `json:"commentedLines,omitempty"`
+	// ForeignTools 是检测到的其他 Hosts 加速工具（按区块注释里的品牌特征识别）。
+	ForeignTools []string `json:"foreignTools,omitempty"`
+}
+
+// foreignToolMarks 是已知 Hosts 加速工具的「指纹」。
+//
+// 只认各家工具自己写进 hosts 的品牌字样（注释行里的产品名），
+// 不去猜 IP 段——猜 IP 会把用户自己的内网解析误判成外来工具。
+var foreignToolMarks = []struct {
+	Name  string
+	Marks []string
+}{
+	{"Watt Toolkit（Steam++）", []string{"steam++", "watt toolkit"}},
+	{"FastGithub", []string{"fastgithub"}},
+	{"UsbEAm Hosts Editor", []string{"usbeam"}},
+	{"SwitchHosts", []string{"switchhosts"}},
+	{"GitHub520", []string{"github520"}},
+	{"dev-sidecar", []string{"dev-sidecar"}},
+	{"fetch-github-hosts", []string{"fetch-github-hosts"}},
+}
+
+// detectForeignTools 扫描 hosts 区块外的文本，返回识别到的其他加速工具名（去重保序）。
+func detectForeignTools(outside string) []string {
+	if outside == "" {
+		return nil
+	}
+	lower := strings.ToLower(outside)
+	var out []string
+	for _, t := range foreignToolMarks {
+		for _, m := range t.Marks {
+			if strings.Contains(lower, m) {
+				out = append(out, t.Name)
+				break
+			}
+		}
+	}
+	return out
+}
+
+// sampleLines 取前 n 条样本，每条按字符截断，避免把整份 hosts 塞进界面。
+func sampleLines(lines []string, n int) []string {
+	if len(lines) == 0 {
+		return nil
+	}
+	if len(lines) > n {
+		lines = lines[:n]
+	}
+	out := make([]string, 0, len(lines))
+	for _, l := range lines {
+		r := []rune(strings.TrimSpace(l))
+		if len(r) > 120 {
+			l = string(r[:120]) + "…"
+		}
+		out = append(out, l)
+	}
+	return out
+}
+
 // mutateHosts 对指定路径的 Hosts 文件执行区块替换：
 // entries 非空时写入新区块，nil 时删除区块。供 ApplyHosts/RemoveHosts 与测试共用。
 func mutateHosts(path, backupPath string, entries map[string]string) error {
+	_, err := mutateHostsReport(path, backupPath, entries)
+	return err
+}
+
+// mutateHostsReport 是 mutateHosts 的带报告版本，返回本次对区块外内容的影响。
+func mutateHostsReport(path, backupPath string, entries map[string]string) (HostsReport, error) {
+	var rep HostsReport
 	if err := backupHosts(path, backupPath); err != nil {
-		return fmt.Errorf("备份 Hosts 失败: %w", err)
+		return rep, fmt.Errorf("备份 Hosts 失败: %w", err)
 	}
 
 	var old []byte
 	old, readErr := os.ReadFile(path)
 	if readErr != nil && !os.IsNotExist(readErr) {
-		return fmt.Errorf("读取 Hosts 失败: %w", readErr)
+		return rep, fmt.Errorf("读取 Hosts 失败: %w", readErr)
 	}
 
 	before, _, after, found, err := splitBlock(string(old))
 	if err != nil {
-		return err
+		return rep, err
 	}
 
 	var newContent string
 	if entries == nil {
 		if !found {
-			return nil // 无区块，无需处理
+			return rep, nil // 无区块，无需处理
 		}
 		// 删除区块，并恢复之前被 ghsmart 注释的用户行
 		newContent = strings.TrimLeft(restoreCommented(before)+restoreCommented(after), "\n\r")
 	} else {
 		// 写入区块前，把区块外与待写入域名冲突的用户行注释掉，
-		// 否则 Windows hosts「首条匹配优先」会让加速记录失效
+		// 否则 Windows hosts「首条匹配优先」会让加速记录失效。
+		// 同时把这些行记进报告——动了用户的内容就必须说出来。
 		domains := make(map[string]struct{}, len(entries))
 		for d := range entries {
 			domains[d] = struct{}{}
 		}
-		newContent = strings.TrimLeft(
-			commentOutConflicts(before, domains)+renderBlock(entries)+commentOutConflicts(after, domains),
-			"\n\r")
+		beforeOut, hitsBefore := commentOutConflictsReport(before, domains)
+		afterOut, hitsAfter := commentOutConflictsReport(after, domains)
+		hits := append(hitsBefore, hitsAfter...)
+		rep.Commented = len(hits)
+		rep.CommentedLines = sampleLines(hits, 5)
+		// 外来工具只在「区块外」找：我们自己的区块头里没有这些品牌字样，
+		// 但只扫区块外更保险，也避免将来改了区块头文案就误报。
+		rep.ForeignTools = detectForeignTools(before + "\n" + after)
+		newContent = strings.TrimLeft(beforeOut+renderBlock(entries)+afterOut, "\n\r")
 	}
 
 	note, err := writeHostsAtomic(path, []byte(newContent))
 	if err != nil {
-		return err
+		return rep, err
 	}
 	if note != "" {
 		fmt.Fprintln(os.Stderr, note)
 	}
-	return nil
+	return rep, nil
 }

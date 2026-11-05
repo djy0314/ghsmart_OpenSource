@@ -3,6 +3,8 @@
 
 export function ActivatePro(arg1:string):Promise<void>;
 
+export function CheckUpdate():Promise<Record<string, any>>;
+
 export function ClearLicense():Promise<void>;
 
 export function GetAppliedEntries():Promise<Record<string, string>>;
@@ -12,6 +14,8 @@ export function GetMachineCode():Promise<string>;
 export function GetProState():Promise<Record<string, any>>;
 
 export function IsElevated():Promise<boolean>;
+
+export function OpenReleasePage():Promise<void>;
 
 export function QuitApp():Promise<void>;
 
@@ -28,5 +32,7 @@ export function SetDeepAccel(arg1:boolean):Promise<Record<string, any>>;
 export function SetGitHTTPS(arg1:boolean):Promise<Record<string, any>>;
 
 export function Shutdown():Promise<void>;
+
+export function SkipUpdate():Promise<Record<string, any>>;
 
 export function StartApply():Promise<void>;

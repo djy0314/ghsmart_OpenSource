@@ -14,7 +14,7 @@
 
 ## 🚀 普通用户下载
 
-不需要懂代码！请点击右侧的 **[Releases](https://github.com/djy0314/ghsmart_OpenSource/releases)** 页面，下载最新的 `ghsmart_v1.0.8.zip`，解压后双击 `ghsmart.exe` 即用（单文件，无安装、无依赖）。官方发布包提供 SHA-256 校验值。
+不需要懂代码！请点击右侧的 **[Releases](https://github.com/djy0314/ghsmart_OpenSource/releases)** 页面，下载最新的 `ghsmart_v1.0.9.zip`，解压后双击 `ghsmart.exe` 即用（单文件，无安装、无依赖）。官方发布包提供 SHA-256 校验值。
 
 ## GUI 版（推荐小白使用）
 

@@ -30,6 +30,7 @@ import (
 	"ghsmart/internal/probe"
 	"ghsmart/internal/proxyguard"
 	"ghsmart/internal/sysproxy"
+	"ghsmart/internal/updater"
 	"ghsmart/internal/webproxy"
 )
 
@@ -87,7 +88,23 @@ type App struct {
 	// 不能每次 emitState 都查；只在启动与切换后刷新。
 	autoMu sync.Mutex
 	autoSt autostart.Status
+
+	// 检查更新：updateInfo 缓存最近一次结果（界面多次 emitState 不必重复请求），
+	// updateBusy 防并发重复检查。失败时不写缓存，下次启动自然重试。
+	updateMu   sync.Mutex
+	updateInfo *updater.Info
+	updateBusy atomic.Bool
+
+	// hostsRepOnce 保证「压制了其他加速工具记录」在一次加速里只提示一遍：
+	// 主域名提前写入与收尾全量写入都会回报，不去重会连弹两次。
+	hostsRepOnce atomic.Bool
 }
+
+// appVersion 是程序版本号，用于检查更新与界面显示。
+//
+// 发版时必须与外面前端 index.html 的两处显示、wails.json 的 productVersion、
+// README 一并同步——漏一处就会出现「检测到新版本 1.0.9，但界面写着 1.0.8」。
+const appVersion = "1.0.9"
 
 // NewApp 创建应用实例。
 func NewApp() *App {
@@ -142,6 +159,13 @@ func (a *App) startup(ctx context.Context) {
 	// 查一次自启状态（要 fork schtasks，只查这一次，之后走缓存）。
 	a.refreshAutoStatus()
 	a.emitState()
+	// 检查更新：异步、失败静默、绝不阻塞启动。
+	//
+	// 所有用户都检查（含未授权）：ghsmart 是「同一份程序 + 授权解锁」，
+	// 免费用户同样需要拿到 bug 修复——比如 v1.0.8 修的 SSH 改写，
+	// 老版本一旦被点过「一键加速」就会把 SSH 推送弄坏，不给免费用户升级通道
+	// 等于把最普遍的伤害留在最多的人身上。
+	go a.checkUpdateAsync()
 	if a.silent {
 		a.logf("静默自启：已按上次状态恢复（深度加速=%v，自愈=%v，窗口隐藏到托盘）",
 			a.deepOn.Load(), a.healOn.Load())
@@ -275,13 +299,16 @@ func (a *App) StartApply() error {
 		return errors.New("正在执行中，请稍候")
 	}
 	cfg := a.loadCfg()
+	// 新一轮加速：允许再报一次 hosts 冲突（上一轮的提示已经翻篇了）
+	a.hostsRepOnce.Store(false)
 
 	// ★ 缓存秒应用（核心提速）：有新鲜缓存时 0.1 秒内写 Hosts + 刷 DNS，
 	// 用户立刻可用；随后在后台静默发起一轮全新探测，发现更优 IP 再悄悄替换并提示。
 	cached := a.loadFreshCache(cfg)
 	if len(cached) > 0 {
-		if err := executor.ApplyHosts(cached); err == nil {
+		if rep, err := executor.ApplyHostsReport(cached); err == nil {
 			a.invalidateAllHostIP()
+			a.reportHostsConflict(rep)
 			a.logf("缓存秒应用: 已写入 %d 条缓存记录，后台即将重新校验", len(cached))
 			runtime.EventsEmit(a.ctx, "engine:cache", map[string]any{
 				"ok": true, "written": len(cached),
@@ -309,6 +336,9 @@ func (a *App) StartApply() error {
 					"ok": true, "written": len(entries),
 				})
 			},
+			// 压住了别的加速工具的记录就必须说出来（引擎在主域名提前写入与
+			// 收尾写入两处都会回报，reportHostsConflict 内部去重）
+			OnHostsConflict: func(rep executor.HostsReport) { a.reportHostsConflict(rep) },
 		})
 		// hosts 区块可能刚刚被改写：代理手里的 IP 缓存必须作废，
 		// 否则「刚优选出的新 IP」要等 10 分钟才生效（这是双加速叠加的必要配合）。
@@ -444,9 +474,13 @@ func (a *App) applyCacheOnStartup(cfg *config.Config) {
 	// 区块已与缓存一致时不必重写（避免无谓地动 Hosts 文件）
 	if cur, err := executor.ReadHostsBlock(); err == nil && hostsEntriesEqual(cur, cached) {
 		a.logf("启动检查: Hosts 区块与缓存一致（%d 条），跳过重写", len(cached))
-	} else if err := executor.ApplyHosts(cached); err != nil {
+	} else if rep, err := executor.ApplyHostsReport(cached); err != nil {
 		a.logf("启动缓存秒应用失败: %v", err)
 		return
+	} else {
+		// 启动时也可能压住别人的记录（用户在这一版之前装过别的加速器）：
+		// 一样要说，不能因为「是自动做的」就悄悄处理
+		a.reportHostsConflict(rep)
 	}
 	a.invalidateAllHostIP()
 	a.emitStatus("已用缓存恢复加速（"+fmt.Sprint(len(cached))+" 条），后台校验更优 IP 中...", "ok")
@@ -631,6 +665,10 @@ type licenseState struct {
 	// 旧版无条件把 SSH 改写成 HTTPS，升级后必须主动清一次存量，
 	// 否则改代码等于没改（用户的 git push 还是坏的）。只做一次，不反复 fork git。
 	Migrated108 bool `json:"migrated_108"`
+
+	// SkippedVersion 记录用户明确「先不升级」的版本号。
+	// 有了它，跳过就是真的跳过——同一个版本不会每次开机都来烦一次。
+	SkippedVersion string `json:"skipped_version"`
 }
 
 // licensePath 返回授权状态文件路径（默认 ~/.ghsmart/license.json）。
@@ -750,6 +788,10 @@ func (a *App) proState() map[string]any {
 	m["autoStartMode"] = string(auto.Mode)
 	m["autoStartNeedsUAC"] = auto.NeedsUAC
 	m["autoStartDetail"] = auto.Detail
+	// 版本与更新状态：前端标题栏和「检查更新」按钮都靠它，不在前端写死版本号
+	for k, v := range a.updatePayload() {
+		m[k] = v
+	}
 	a.deepMu.Lock()
 	if a.deepMode != "" {
 		m["deepMode"] = a.deepMode
@@ -898,6 +940,186 @@ func (a *App) SetCLIProxyEnv(on bool) (map[string]any, error) {
 	go a.syncCLIProxy()
 	a.emitState()
 	return a.proState(), nil
+}
+
+// ---------- Hosts 共存冲突告知 ----------
+
+// reportHostsConflict 把「本次动过 Hosts 区块外的记录」如实告诉用户。
+//
+// 背景：ghsmart 写入前会注释掉与待写域名冲突的既有行（否则 Windows
+// 「首条匹配优先」会把我们的记录压住，加速等于没做）。但那些行往往不是用户
+// 手写的，而是**另一款加速工具**写的——被注释掉的那款就会莫名失效。
+// 以前的实现默默处理，用户完全不知道，于是「装了两个加速器其中一个不灵」
+// 这类问题永远查不出原因。
+//
+// 只提示一次（hostsRepOnce）：一轮加速里主域名提前写入与收尾写入都会回报，
+// 去重后用户只看到一条，不会觉得软件在刷屏。
+//
+// 返回是否真的向用户报告了（供测试断言去重规则，调用方可忽略）。
+func (a *App) reportHostsConflict(rep executor.HostsReport) bool {
+	if rep.Commented == 0 && len(rep.ForeignTools) == 0 {
+		return false
+	}
+	if !a.hostsRepOnce.CompareAndSwap(false, true) {
+		return false
+	}
+
+	msg := ""
+	if len(rep.ForeignTools) > 0 {
+		msg = fmt.Sprintf("检测到 %s 也在管理相同的域名。为避免互相抢，已把它写的 %d 条记录临时注释；"+
+			"关闭加速时会原样恢复。两款加速工具同时开容易互相干扰，建议只保留一款。",
+			strings.Join(rep.ForeignTools, "、"), rep.Commented)
+	} else {
+		msg = fmt.Sprintf("Hosts 里有 %d 条与本次加速域名冲突的记录（可能来自其他加速工具），"+
+			"已临时注释以免抢生效；关闭加速时会原样恢复。", rep.Commented)
+	}
+	a.logf("Hosts 共存提示: %s（被注释样本: %v）", msg, rep.CommentedLines)
+	payload := map[string]any{
+		"commented": rep.Commented,
+		"lines":     rep.CommentedLines,
+		"tools":     rep.ForeignTools,
+		"message":   msg,
+	}
+	if a.ctx != nil {
+		runtime.EventsEmit(a.ctx, "engine:hosts-conflict", payload)
+	}
+	a.emitStatus("已加速，但压制了其他加速工具的记录（详见提示）", "warn")
+	return true
+}
+
+// ---------- 检查更新 ----------
+
+// updatePayload 组装版本与更新状态（唯一事实来源，供 proState 与事件共用）。
+//
+// 未检查过时也要返回 version：「界面显示 1.0.9」不依赖网络，
+// 更不该由前端写死——否则发版时四处同步漏一处，界面就开始撒谎。
+func (a *App) updatePayload() map[string]any {
+	a.updateMu.Lock()
+	defer a.updateMu.Unlock()
+	m := map[string]any{
+		"version":         appVersion,
+		"updateAvailable": false,
+	}
+	if a.updateInfo == nil {
+		return m
+	}
+	i := a.updateInfo
+	m["updateAvailable"] = i.HasUpdate
+	m["latest"] = i.Latest
+	m["tag"] = i.Tag
+	m["url"] = i.URL
+	m["notes"] = i.Notes
+	m["publishedAt"] = i.PublishedAt
+	return m
+}
+
+// checkUpdateAsync 在后台检查一次更新：失败静默、不阻塞启动。
+//
+// 启动路径上多等一秒，用户就觉得软件卡——所以这里先睡 3 秒避开
+// 「缓存秒应用 + 后台探测」的网络与 CPU 高峰，再发请求。
+// 查询失败（公司防火墙拦 api.github.com、GitHub 限流）只写日志，
+// 绝不让状态栏变红：查不到更新不是错误，软件照常能用。
+func (a *App) checkUpdateAsync() {
+	if !updater.Enabled() {
+		a.logf("检查更新: 已通过 GHSMART_NO_UPDATE_CHECK 关闭")
+		return
+	}
+	if !a.updateBusy.CompareAndSwap(false, true) {
+		return
+	}
+	defer a.updateBusy.Store(false)
+
+	time.Sleep(3 * time.Second)
+
+	info, err := updater.Check(context.Background(), appVersion)
+	if err != nil {
+		a.logf("检查更新失败（不影响使用）: %v", err)
+		return
+	}
+	// 用户明确跳过过这个版本 → 尊重选择：连「有待更新」这个状态都不留。
+	// 若只 return 不改 info，下一次 emitState 又会把徽标顶回来，跳过就成了摆设。
+	skipped := false
+	if info.HasUpdate {
+		if st := a.loadLicenseState(); st.SkippedVersion == info.Latest {
+			skipped = true
+			info.HasUpdate = false
+		}
+	}
+	a.updateMu.Lock()
+	a.updateInfo = info
+	a.updateMu.Unlock()
+	a.logf("检查更新: 本地 %s，远端 %s，有新版本=%v（已跳过该版本=%v）",
+		info.Current, info.Latest, info.HasUpdate, skipped)
+
+	if !info.HasUpdate {
+		return
+	}
+	a.emitStatus(fmt.Sprintf("发现新版本 %s（右上角查看）", info.Tag), "ok")
+	if a.ctx != nil {
+		runtime.EventsEmit(a.ctx, "app:update", a.updatePayload())
+	}
+}
+
+// CheckUpdate 是前端「检查更新」按钮的入口：手动触发时用户需要知道结果，
+// 所以失败要把原因返回出去（与后台静默检查不同）。
+func (a *App) CheckUpdate() (map[string]any, error) {
+	if !updater.Enabled() {
+		return a.updatePayload(), errors.New("更新检查已被环境变量 GHSMART_NO_UPDATE_CHECK 关闭")
+	}
+	info, err := updater.Check(context.Background(), appVersion)
+	if err != nil {
+		return a.updatePayload(), fmt.Errorf("检查更新失败（可能是网络或被限流）: %w", err)
+	}
+	a.updateMu.Lock()
+	a.updateInfo = info
+	a.updateMu.Unlock()
+	a.logf("手动检查更新: 本地 %s，远端 %s，有新版本=%v", info.Current, info.Latest, info.HasUpdate)
+	return a.updatePayload(), nil
+}
+
+// OpenReleasePage 用系统浏览器打开新版本下载页。
+//
+// 不接受前端传参：只打开后端自己从 GitHub API 拿到的地址（或仓库固定地址），
+// 避免这个绑定方法退化成一个「任意 URL 打开器」。
+func (a *App) OpenReleasePage() error {
+	url := "https://github.com/djy0314/ghsmart_OpenSource/releases/latest"
+	a.updateMu.Lock()
+	if a.updateInfo != nil && a.updateInfo.URL != "" {
+		url = a.updateInfo.URL
+	}
+	a.updateMu.Unlock()
+	if a.ctx == nil {
+		return errors.New("应用尚未就绪")
+	}
+	runtime.BrowserOpenURL(a.ctx, url)
+	a.logf("已打开下载页: %s", url)
+	return nil
+}
+
+// SkipUpdate 记住「这个版本先不升级」，此后不再为它提示。
+func (a *App) SkipUpdate() map[string]any {
+	a.updateMu.Lock()
+	latest := ""
+	if a.updateInfo != nil {
+		latest = a.updateInfo.Latest
+	}
+	a.updateMu.Unlock()
+	if latest != "" {
+		st := a.loadLicenseState()
+		st.SkippedVersion = latest
+		if err := a.saveLicenseState(st); err != nil {
+			a.logf("保存跳过版本失败: %v", err)
+		} else {
+			a.logf("用户选择跳过版本 %s", latest)
+		}
+		// 同步把「有待更新」清掉：否则界面每次刷新都会把徽标重新显示出来
+		a.updateMu.Lock()
+		if a.updateInfo != nil {
+			a.updateInfo.HasUpdate = false
+		}
+		a.updateMu.Unlock()
+	}
+	return a.updatePayload()
 }
 
 // SetAutoStart 开关「开机自动启动并最小化到托盘」。

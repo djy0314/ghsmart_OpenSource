@@ -237,6 +237,29 @@ type Options struct {
 	// 这是 v1.0.8 的安全默认——旧版无条件把 git@github.com: 改写成 HTTPS，
 	// 会让用 SSH key 推送的用户 push 失败，属于不该有的破坏性默认值。
 	GitLevel string
+
+	// OnHostsConflict 在写入 Hosts 后回报「本次动了区块外哪些内容」：
+	// 注释掉了几行与待写域名冲突的既有记录、检测到哪些其他加速工具。
+	//
+	// 为什么必须回调：冲突行会被注释（否则 Windows 首条匹配优先会压住我们的记录），
+	// 但压住别的工具的记录是有代价的——用户装了第二款加速器时，
+	// 那一款会莫名失效。不告诉用户，这种问题永远查不出来。
+	//
+	// 只在确实有影响时回调（Commented==0 且无外来工具时不调用）。
+	// 主域名提前写入与收尾写入**都会**回调，调用方需自行去重。
+	OnHostsConflict func(rep executor.HostsReport)
+}
+
+// notifyHostsConflict 只在「确实动了区块外内容」时回调，
+// 避免界面收到一堆「本次什么都没碰」的空报告。
+func notifyHostsConflict(opts Options, rep executor.HostsReport) {
+	if opts.OnHostsConflict == nil {
+		return
+	}
+	if rep.Commented == 0 && len(rep.ForeignTools) == 0 {
+		return
+	}
+	opts.OnHostsConflict(rep)
 }
 
 // RunApply 执行一轮「解析 -> 探测 -> 决策 -> 写 Hosts」。
@@ -295,7 +318,9 @@ func RunApplyOpts(ctx context.Context, cfg *config.Config, r Reporter, opts Opti
 			// 本协程在 wg.Wait() 之前执行完毕，与收尾的全量写入天然不并发。
 			if domain == primary && opts.OnPrimary != nil && len(res.entries) > 0 {
 				if merged, merr := mergeIntoCurrentBlock(res.entries); merr == nil {
-					if aerr := executor.ApplyHosts(merged); aerr == nil {
+					rep, aerr := executor.ApplyHostsReport(merged)
+					if aerr == nil {
+						notifyHostsConflict(opts, rep)
 						opts.OnPrimary(merged)
 					} else {
 						r.Warn("主域名提前写入 Hosts 失败: " + aerr.Error())
@@ -348,9 +373,11 @@ func RunApplyOpts(ctx context.Context, cfg *config.Config, r Reporter, opts Opti
 		r.Warn("保存状态失败: " + err.Error())
 	}
 	// restricted 时 entries 必为空 → ApplyHosts(空) 会清空区块（自动清理残留的无效记录）
-	if err := executor.ApplyHosts(entries); err != nil {
+	rep, err := executor.ApplyHostsReport(entries)
+	if err != nil {
 		return entries, lines, restricted, fmt.Errorf("写入 Hosts 失败（请以管理员身份运行）: %w", err)
 	}
+	notifyHostsConflict(opts, rep)
 	// git 加速：写 Hosts 成功后按档位同步应用 insteadOf 改写。
 	// 失败不致命（未装 git 等），只告警，不影响主流程。
 	// 档位由调用方决定（默认档不改写 SSH，见 Options.GitLevel）。
