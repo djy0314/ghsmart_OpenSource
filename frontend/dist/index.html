@@ -49,7 +49,7 @@
     }
     #go-btn:hover:not(:disabled) { filter: brightness(1.1); }
     #go-btn:active:not(:disabled) { transform: scale(.99); }
-    #go-btn:disabled { filter: grayscale(.7) brightness(.7); cursor: not-allowed; }
+    #go-btn:disabled, #go-btn.busy { filter: grayscale(.7) brightness(.7); cursor: progress; }
 
     #results {
       flex: 1; min-height: 0; overflow-y: auto; border: 1px solid var(--line);
@@ -229,7 +229,9 @@
   <header>
     <svg class="logo" viewBox="0 0 512 512"><rect x="16" y="16" width="480" height="480" rx="96" fill="#0f172a" stroke="#38bdf8" stroke-width="12"/><polygon points="300,60 170,270 250,270 200,452 360,230 270,230 330,60" fill="#34d399"/></svg>
     <h1>ghsmart</h1>
-    <span class="ver" id="ver-text">Free v1.0.9 · 纯本地加速</span>
+    <!-- 兜底文本只写版本号、不写 Free/Pro：真实授权状态由后端 proState 给，
+         在它回来之前谎称「Free」会让已付费用户看到一闪而过的错信息 -->
+    <span class="ver" id="ver-text">v1.0.10</span>
     <!-- 有新版本时才出现：点徽标去下载页，点 × 表示「这个版本先不管」 -->
     <span id="update-wrap">
       <button id="update-badge" type="button" title="发现新版本，点击查看下载页">新版本</button>
@@ -362,11 +364,50 @@
       statusText.classList.toggle("busy", cls === "busy");
     }
 
-    // 一键加速按钮的忙碌态：禁用 + 文案换成动态提示（绝不看起来像个死物）
+    // 给任何一次后端调用套上「最多等多久」的护栏。
+    //
+    // 为什么必须有（v1.0.9 实机事故）：Wails 的方法是 await 的，只要后端因为
+    // 任何原因（写注册表被安全软件卡住、系统代理还原、schtasks 被拦、磁盘 IO）
+    // 不返回，await 就永远不结束 —— 而把界面「解锁」的代码写在 finally 里，
+    // finally 也永远不会执行。表现就是：按钮点了没反应、开关变灰关不掉、
+    // 只能关掉软件重开。超时之后我们自己解锁并如实告诉用户，绝不静默卡死。
+    function withTimeout(promise, ms, label) {
+      return new Promise((resolve, reject) => {
+        let done = false;
+        const timer = setTimeout(() => {
+          if (done) return;
+          done = true;
+          reject(new Error((label ? label + "：" : "") + "后端 " + Math.round(ms / 1000) + " 秒无响应，已恢复按钮，请重试"));
+        }, ms);
+        Promise.resolve(promise).then(
+          (v) => { if (done) return; done = true; clearTimeout(timer); resolve(v); },
+          (e) => { if (done) return; done = true; clearTimeout(timer); reject(e); });
+      });
+    }
+
+    // 一键加速按钮的忙碌态。
+    //
+    // 刻意**不用** disabled：disabled 的按钮连 click 都不触发，用户点了是彻底的
+    // 零反馈（v1.0.9 实机投诉「点了没反应」就是这么来的）。改成 .busy 样式 +
+    // 事件里的守卫：看起来一样是「进行中」，但点下去会明确告诉你一句实话。
     const GO_LABEL = "🚀 一键智能加速";
     function setGoBusy(busy) {
-      goBtn.disabled = busy;
+      goBtn.classList.toggle("busy", !!busy);
       goBtn.textContent = busy ? "正在探测，请稍候..." : GO_LABEL;
+    }
+
+    // ===== 一轮加速的忙碌闸 =====
+    // 解锁有三条路径，缺一条就会出现「按钮永远点不动」：
+    //   1) 后端终态事件（engine:applied / removed / netrestricted）
+    //   2) StartApply 调用本身抛错（忙闸占用、应用未就绪）
+    //   3) 看门狗超时（后端事件因任何原因没到）—— 这条是最后的保险
+    // 所有路径都必须走 endRun()，谁都不能直接改 goBtn.disabled。
+    let runBusy = false, runTimer = null;
+    const RUN_WATCHDOG_MS = 45000;
+    function endRun() {
+      runBusy = false;
+      if (runTimer) { clearTimeout(runTimer); runTimer = null; }
+      setGoBusy(false);
     }
 
     // 结果区整块替换用 replaceChildren（innerHTML 置空会造成瞬间空白区）
@@ -576,9 +617,10 @@
       });
 
       EventsOn("deep:closed", (d) => {
+        if (deepCloseTimer) { clearTimeout(deepCloseTimer); deepCloseTimer = null; }
         // 后端把系统代理彻底还原了（这是关闭流程的「真正完成」时刻）。
         // 用后端权威状态收尾：万一用户刚才又点开了，就别拿这条旧事件覆盖界面。
-        app.GetProState().then((st) => {
+        withTimeout(app.GetProState(), 8000, "读取状态").then((st) => {
           renderState(st);
           if (st.deepAccel) return;
           if (d && d.err) {
@@ -593,8 +635,19 @@
       });
 
       EventsOn("engine:applied", (d) => {
-        setGoBusy(false);
+        endRun();
         const written = d.written || 0;
+        if (d.inconclusive) {
+          // 证据不足：探测做完了，但真实业务校验没跑完（网络太慢/受限）。
+          // 这时后端**没有**动 Hosts 也没有清缓存 —— 界面上的「当前生效」
+          // 必须原样保留，并且说清「上次的还在」。不能让用户以为加速被清空了
+          // （v1.0.9 就是在这一步谎报「全部域名不可用」，把人吓到了）。
+          // 判断顺序有讲究：inconclusive 走的是 ok=false，必须排在失败分支之前，
+          // 否则会被当成「加速失败」报红，比实际情况更吓人。
+          setStatus("网络较慢，本轮未完成验证（已保留上次的加速记录）", "warn");
+          toast("⚠️ 网络较慢，本轮没能完成真实验证。已保留上次的加速记录，可稍后重试。", "warn");
+          return;
+        }
         if (d.entries) setAppliedInfo(Object.keys(d.entries).length);
         else if (written > 0) $("applied-info").textContent = `已写入: ${written} 条加速记录`;
         else setAppliedInfo(0);
@@ -619,7 +672,7 @@
 
       // 托盘里的「恢复 Hosts」路径：窗口看不见时还原完成，靠这个事件同步界面
       EventsOn("engine:removed", () => {
-        setGoBusy(false);
+        endRun();
         setStatus("已安全还原", "ok");
         setAppliedInfo(0);
         toast("已安全还原", "ok");
@@ -628,7 +681,7 @@
 
       // 受限网络（所有 IP 均未通过真实业务校验，典型：公司 VPN 全量 RST）
       EventsOn("engine:netrestricted", () => {
-        setGoBusy(false);
+        endRun();
         setStatus("当前网络环境受限（如公司 VPN），无法通过修改 Hosts 加速。", "err");
         setAppliedInfo(0);
         toast("⚠ 检测到严重网络限制，无法为您加速。请检查是否开启了公司 VPN 或安全软件。", "err");
@@ -668,13 +721,16 @@
       const cur = el.classList.contains("on");
       el.style.pointerEvents = "none";
       try {
-        const st = await call(!cur);
+        // 8 秒护栏：后端写配置文件/注册表卡住时，宁可报超时也不能让开关变死。
+        const st = await withTimeout(call(!cur), 8000, "切换设置");
         renderState(st);
         renderOpts(st);
       } catch (e) {
         const msg = (e && e.message) ? e.message : String(e);
         toast("⚠️ " + msg, "err");
         if (statusText) statusText.textContent = msg;
+        // 失败/超时后必须回读后端真实状态，不能让界面停在「我以为的样子」
+        try { renderState(await withTimeout(app.GetProState(), 5000, "读取状态")); } catch (_) {}
       } finally {
         el.style.pointerEvents = "";
       }
@@ -691,7 +747,7 @@
     $("update-badge").addEventListener("click", async (e) => {
       e.stopPropagation();
       try {
-        await app.OpenReleasePage();
+        await withTimeout(app.OpenReleasePage(), 8000, "打开下载页");
         toast("已在浏览器打开下载页", "ok");
       } catch (err) {
         toast("打开下载页失败：" + ((err && err.message) || err), "err");
@@ -700,7 +756,7 @@
     $("update-skip").addEventListener("click", async (e) => {
       e.stopPropagation();
       try {
-        const s = await app.SkipUpdate();
+        const s = await withTimeout(app.SkipUpdate(), 8000, "跳过版本");
         renderUpdate(s); // 用后端返回值收徽标，不在前端猜
         toast("已跳过这个版本，之后不再提示", "ok");
       } catch (err) {
@@ -721,16 +777,35 @@
     app.GetProState().then(renderState);
 
     // ===== 一键加速 =====
+    // 每一次点击都必须有明确结果：要么真的开跑（后端会回终态事件），
+    // 要么当场告诉用户「正在跑，别急」。绝不允许「点了没反应」。
     goBtn.addEventListener("click", async () => {
+      if (runBusy) {
+        toast("上一轮还在探测中，请稍候（已完成会自动解锁）", "warn");
+        return;
+      }
+      runBusy = true;
+      setGoBusy(true);
+      resetResults();
+      setStatus("正在探测，请稍候...", "busy");
+      runTimer = setTimeout(() => {
+        if (!runBusy) return;
+        endRun();
+        setStatus("本轮探测没有正常结束（已强制解锁），请重试", "warn");
+        toast("探测超时，按钮已解锁。若反复出现，请点「一键还原网络」后重试。", "warn");
+      }, RUN_WATCHDOG_MS);
+
+      let kicked = false;
       try {
-        setGoBusy(true);
-        resetResults();
-        setStatus("正在探测，请稍候...", "busy");
-        await app.StartApply();
+        await withTimeout(app.StartApply(), 15000, "启动探测");
+        kicked = true; // 已开跑：解锁交给后端终态事件，不在这里放行
       } catch (e) {
-        setGoBusy(false);
         setStatus("加速失败", "err");
-        toast(String(e), "err");
+        toast(String((e && e.message) || e), "err");
+      } finally {
+        // 只有「没开跑」才在这里解锁；开跑的一轮由终态事件/看门狗收尾，
+        // 否则界面会比后端先松手，用户能连点出多轮探测。
+        if (!kicked) endRun();
       }
     });
 
@@ -741,13 +816,15 @@
     $("modal-yes").addEventListener("click", async () => {
       mask.classList.remove("show");
       hideHint();
+      // 还原要动注册表 + Hosts，被安全软件拦住时能停好几秒：给它 20 秒，
+      // 超时就明说「没还原干净」，绝不假装成功、也绝不让窗口像死了一样。
       try {
-        await app.RemoveHosts();
+        await withTimeout(app.RemoveHosts(), 20000, "还原网络");
+        // 成功路径由 engine:removed 事件统一渲染（含托盘触发），避免双写状态
       } catch (e) {
-        toast(String(e), "err");
-        setStatus("还原失败", "err");
+        toast("⚠️ " + String((e && e.message) || e), "err");
+        setStatus("还原失败（可再试一次，或用托盘菜单退出）", "err");
       }
-      // 成功路径由 engine:removed 事件统一渲染（含托盘触发），避免双写状态
     });
 
     // ===== Pro：解锁模态框 + 开关 =====
@@ -765,8 +842,10 @@
     }
 
     $("pro-toggle").addEventListener("click", async () => {
+      const el = $("pro-toggle");
+      el.style.pointerEvents = "none";
       try {
-        const st = await app.GetProState();
+        const st = await withTimeout(app.GetProState(), 8000, "读取状态");
         if (!st.pro) {
           openProModal();
           return;
@@ -774,17 +853,22 @@
         // 以「后端当前状态取反」为目标，并用后端返回值渲染，
         // 不做任何本地状态猜测——这是开关能可靠关闭的前提
         const next = !st.autoHeal;
-        const st2 = await app.SetAutoHeal(next);
+        const st2 = await withTimeout(app.SetAutoHeal(next), 10000, "切换后台自愈");
         renderState(st2);
         toast(st2.autoHeal ? "⚡ 后台自动自愈已开启" : "后台自动自愈已关闭", "ok");
       } catch (e) {
-        toast(String(e), "err");
+        toast("⚠️ " + String((e && e.message) || e), "err");
+        // 超时/失败后回读真实状态，避免界面撒谎
+        try { renderState(await withTimeout(app.GetProState(), 5000, "读取状态")); } catch (_) {}
+      } finally {
+        el.style.pointerEvents = "";
       }
     });
     // ===== 深度网页加速（Pro）：点一下就是开，点一下就是关 =====
     // 没有模式选择、没有预检拦截、没有兼容勾选——用户只需要知道开没开。
     // 连不上由代理层自己降级（状态栏显示「已开启 · 智能降级」）。
     let deepBusy = false;
+    let deepCloseTimer = null; // 关闭深度加速的看门狗（12 秒没确认就回读真实状态）
     // 关闭是「乐观 + 异步」的：后端状态立刻变 false，若用户 500ms 内又点一下，
     // 会被当成新一次「开启」，把刚关的又打开。用时间戳吃掉这种手抖连点。
     let deepClosedAt = 0;
@@ -802,13 +886,15 @@
     }
 
     $("deep-toggle").addEventListener("click", async () => {
-      if (deepBusy) return;
-      if (Date.now() - deepClosedAt < 500) return; // 刚关完，吃掉误触
+      // 两个 guard 都不许「静默 return」：点了没反应是 v1.0.9 最刺人的体验
+      if (deepBusy) { toast("正在切换深度加速，请稍候…", "warn"); return; }
+      if (Date.now() - deepClosedAt < 500) { toast("正在关闭中，请稍候…", ""); return; }
       let st;
       try {
-        st = await app.GetProState();
+        st = await withTimeout(app.GetProState(), 8000, "读取状态");
       } catch (e) {
-        toast(String(e), "err");
+        toast("⚠️ " + String((e && e.message) || e), "err");
+        try { renderState(await withTimeout(app.GetProState(), 5000, "读取状态")); } catch (_) {}
         return;
       }
       if (!st.pro) {
@@ -831,8 +917,22 @@
         app.SetDeepAccel(false).catch((e) => {
           // 请求本身失败（极少见：后端拒绝/桥接异常）→ 以后端真实状态为准
           toast("清理请求失败：" + String(e), "err");
-          app.GetProState().then(renderState).catch(() => {});
+          withTimeout(app.GetProState(), 5000, "读取状态").then(renderState).catch(() => {});
         });
+        // 关闭是异步的：deep:closed 才是「真的关掉了」。但事件也可能因为
+        // 后端卡住而不来 —— 12 秒没收到就回读一次真实状态并说明，
+        // 绝不让界面停在「我以为关了」或「绿着但点不动」两种糊涂状态里。
+        if (deepCloseTimer) clearTimeout(deepCloseTimer);
+        deepCloseTimer = setTimeout(async () => {
+          try {
+            const real = await withTimeout(app.GetProState(), 5000, "读取状态");
+            renderState(real);
+            if (real.deepAccel) {
+              setStatus("深度加速仍在开启（关闭未完成），可再点一次", "warn");
+              toast("关闭没有完成：系统代理还原被占用。可再点一次关闭，或点「一键还原网络」。", "warn");
+            }
+          } catch (_) {}
+        }, 12000);
         return;
       }
 
@@ -840,7 +940,7 @@
       deepBusy = true;
       setStatus("正在开启深度加速...", "busy");
       try {
-        const st2 = await app.SetDeepAccel(true);
+        const st2 = await withTimeout(app.SetDeepAccel(true), 15000, "开启深度加速");
         renderState(st2);
         hideHint();
         setStatus("深度加速已开启", "ok");
@@ -849,7 +949,7 @@
         toast(String(e), "err");
         setStatus("深度加速开启失败", "err");
         // 失败时以后端真实状态为准，避免界面比后端乐观
-        try { renderState(await app.GetProState()); } catch (_) {}
+        try { renderState(await withTimeout(app.GetProState(), 5000, "读取状态")); } catch (_) {}
       } finally {
         deepBusy = false;
       }
@@ -893,10 +993,16 @@
 
     // ===== 清除授权（测试用）：删 license.json，回 Free =====
     $("clear-lic").addEventListener("click", async () => {
-      const st = await app.GetProState();
+      let st;
+      try {
+        st = await withTimeout(app.GetProState(), 8000, "读取状态");
+      } catch (e) {
+        toast("⚠️ " + String((e && e.message) || e), "err");
+        return;
+      }
       if (!st.pro) { toast("当前未激活，无需清除", "warn"); return; }
       try {
-        await app.ClearLicense();
+        await withTimeout(app.ClearLicense(), 8000, "清除授权");
         // renderState(false) 由 engine:state 事件统一刷新
         toast("已清除授权，回到 Free 版", "ok");
       } catch (e) {

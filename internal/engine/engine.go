@@ -5,6 +5,7 @@ package engine
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sort"
 	"strings"
@@ -20,11 +21,32 @@ import (
 )
 
 // applyTimeout 是单轮 apply 的整体硬超时。
-// 10 秒是产品级硬约束：探测/业务校验 10 秒内必须出结论，绝不卡前端一分钟。
-const applyTimeout = 10 * time.Second
+//
+// 为什么是 30 秒而不是 10 秒（v1.0.10 实机事故的修正）：
+// 探测阶段本身就可能吃掉 10 秒以上——5 个域名 × 最多 3 个候选，探测并发 10，
+// 每个候选的单次探测上限 5 秒。网络差（大量 i/o timeout）时正好是两波 × 5 秒，
+// 而真实业务校验排在探测之后。10 秒预算下，业务校验一次都没跑就被判「全局超时」，
+// 于是所有域名被丢弃、写入 0 条，界面还谎报「全部域名不可用」
+// （实测日志：github.com 明明探到 OK=5 的候选）。
+// 30 秒给业务校验留出足够窗口，同时仍有硬上限，绝不卡住前端。
+const applyTimeout = 30 * time.Second
+
+// ErrInconclusive 表示「本轮没拿到任何可用证据」：候选 IP 探测通过了，
+// 但真实业务校验因为全局预算耗尽没能跑完。
+//
+// 这类结果绝不能当「不可用」处理——把它写进 Hosts 等于用一个「不知道」
+// 抹掉用户上一次确定的加速记录（v1.0.10 实机事故：区块被清空、缓存被清掉）。
+// 调用方收到本错误时应保持现有 Hosts 与缓存不动，只如实告知用户。
+var ErrInconclusive = errors.New("本轮未完成真实业务校验（网络较慢），已保留上次的加速记录")
 
 // businessCheckTimeout 是单个 IP 真实业务校验（GET robots.txt）的时限。
 const businessCheckTimeout = 3 * time.Second
+
+// mustPreserveState 判断「本轮一条记录都没写入」时，是否应该保持现有状态不动。
+// 只要存在「没来得及校验」的域名，就没有资格下「全部不可用」的结论。
+func mustPreserveState(written, inconclusive int) bool {
+	return written == 0 && inconclusive > 0
+}
 
 // Reporter 接收引擎运行事件。CLI 用它打印表格，GUI 用它推送到前端。
 type Reporter interface {
@@ -301,6 +323,7 @@ func RunApplyOpts(ctx context.Context, cfg *config.Config, r Reporter, opts Opti
 	dropped := make([]string, 0)
 	report := make(map[string][]cache.ProbeRecord, len(cfg.Domains)) // 探测报告（预检用）
 	checkRan, checkFailed := 0, 0                                    // 业务校验执行数 / 失败数
+	inconclusive := 0                                                // 「没来得及校验」的域名数（证据不足）
 
 	primary := ""
 	if len(cfg.Domains) > 0 {
@@ -340,6 +363,9 @@ func RunApplyOpts(ctx context.Context, cfg *config.Config, r Reporter, opts Opti
 					checkFailed++
 				}
 			}
+			if res.inconclusive {
+				inconclusive++
+			}
 			// 探测报告：DoH 解析失败的域名没有本轮明细，不进报告（保留证据新鲜度）
 			if len(res.results) > 0 {
 				recs := make([]cache.ProbeRecord, 0, len(res.results))
@@ -365,6 +391,14 @@ func RunApplyOpts(ctx context.Context, cfg *config.Config, r Reporter, opts Opti
 		lines = append(lines, fmt.Sprintf("%s -> (剔除，本轮无可用 IP)", d))
 	}
 	sort.Strings(lines)
+
+	// ★ 证据不足：有域名是「探测通过但业务校验没来得及跑」→ 一条都没写。
+	// 这时候绝不能继续往下走（往下走 = 用空集合覆盖 Hosts，把用户上一次
+	// 确定可用的记录清空、把缓存清掉）。如实返回 ErrInconclusive，让上层
+	// 保留现状并告诉用户「网络较慢，本轮没验证完」。
+	if mustPreserveState(len(entries), inconclusive) {
+		return nil, lines, false, ErrInconclusive
+	}
 
 	if len(entries) == 0 && len(dropped) == 0 {
 		return nil, nil, restricted, fmt.Errorf("本轮没有任何域名处理成功")

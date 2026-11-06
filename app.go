@@ -104,7 +104,7 @@ type App struct {
 //
 // 发版时必须与外面前端 index.html 的两处显示、wails.json 的 productVersion、
 // README 一并同步——漏一处就会出现「检测到新版本 1.0.9，但界面写着 1.0.8」。
-const appVersion = "1.0.9"
+const appVersion = "1.0.10"
 
 // NewApp 创建应用实例。
 func NewApp() *App {
@@ -301,6 +301,9 @@ func (a *App) StartApply() error {
 	cfg := a.loadCfg()
 	// 新一轮加速：允许再报一次 hosts 冲突（上一轮的提示已经翻篇了）
 	a.hostsRepOnce.Store(false)
+	// 起始日志：出问题时「这一轮到底有没有真的跑起来」必须一眼能从日志查到
+	// （v1.0.9 事故排查就是靠日志里的「缓存秒应用」反推出点击确实生效了）。
+	a.logf("一键加速: 开始（域名 %d 个）", len(cfg.Domains))
 
 	// ★ 缓存秒应用（核心提速）：有新鲜缓存时 0.1 秒内写 Hosts + 刷 DNS，
 	// 用户立刻可用；随后在后台静默发起一轮全新探测，发现更优 IP 再悄悄替换并提示。
@@ -322,7 +325,38 @@ func (a *App) StartApply() error {
 		a.emitStatus("正在探测，请稍候...", "busy")
 	}
 	go func() {
-		defer a.busy.Store(false)
+		started := time.Now()
+		writtenCount := 0
+		// settled 保证「本轮只发一次结束信号」：前端把按钮解锁的唯一依据就是它。
+		// 任何一条返回路径（成功/失败/受限/证据不足/panic）都必须走到这里，
+		// 否则按钮会永远停在「正在探测，请稍候...」上——用户只能重启软件。
+		settled := false
+		emitApplied := func(p map[string]any) {
+			if settled {
+				return
+			}
+			settled = true
+			runtime.EventsEmit(a.ctx, "engine:applied", p)
+		}
+		defer func() {
+			if r := recover(); r != nil {
+				a.logf("一键加速协程异常: %v", r)
+				emitApplied(map[string]any{
+					"ok": false, "written": 0,
+					"error": "本轮探测异常结束（已自动恢复），请重试",
+				})
+				a.emitStatus("本轮探测异常结束（已自动恢复），请重试", "err")
+			}
+			// 兜底：既没成功也没失败就结束了（例如引擎返回了未预期状态），
+			// 也必须给前端一个结束信号，绝不能让它无限等待。
+			emitApplied(map[string]any{
+				"ok": false, "written": 0,
+				"error": "本轮探测未产生结果，请重试",
+			})
+			a.busy.Store(false)
+			a.logf("一键加速: 结束，写入 %d 条，耗时 %s", writtenCount, time.Since(started).Round(time.Millisecond))
+		}()
+
 		written, lines, restricted, err := engine.ApplyOnceOpts(cfg, guiReporter{a}, engine.Options{
 			// 档位由用户的「Git 加速（HTTPS 模式）」开关决定：
 			// 默认档只处理已停用的 git://，绝不改用户 SSH 推送路径。
@@ -340,9 +374,24 @@ func (a *App) StartApply() error {
 			// 收尾写入两处都会回报，reportHostsConflict 内部去重）
 			OnHostsConflict: func(rep executor.HostsReport) { a.reportHostsConflict(rep) },
 		})
+		writtenCount = len(written)
 		// hosts 区块可能刚刚被改写：代理手里的 IP 缓存必须作废，
 		// 否则「刚优选出的新 IP」要等 10 分钟才生效（这是双加速叠加的必要配合）。
 		a.invalidateAllHostIP()
+
+		// ★ 证据不足（探测通过但业务校验没跑完）：**什么都不改**。
+		// 这是 v1.0.10 实机事故的正面修正——之前的逻辑会在这里把 Hosts 区块
+		// 写成空块、顺手清掉缓存，等于用一个「不知道」抹掉上次确定可用的加速。
+		if errors.Is(err, engine.ErrInconclusive) {
+			a.logf("本轮证据不足（业务校验未完成），已保留现有 Hosts 与缓存；明细: %s",
+				strings.Join(lines, " | "))
+			emitApplied(map[string]any{
+				"ok": false, "written": 0, "inconclusive": true,
+				"error": "网络较慢，本轮未完成真实验证（已保留上次的加速记录）",
+			})
+			a.emitStatus("网络较慢，本轮未完成验证（已保留上次的加速记录），可稍后重试", "warn")
+			return
+		}
 		// ★ 受限网络（所有 IP 都没通过真实业务校验，典型：公司 VPN 全量 RST）：
 		// 清理无效 Hosts 记录（引擎已把区块清空）+ 清缓存 + 弹红色警告
 		if restricted {
@@ -355,7 +404,7 @@ func (a *App) StartApply() error {
 			return
 		}
 		if err != nil {
-			runtime.EventsEmit(a.ctx, "engine:applied", map[string]any{
+			emitApplied(map[string]any{
 				"ok": false, "lines": lines, "written": 0, "error": err.Error(),
 			})
 			a.emitStatus("加速失败: "+err.Error(), "err")
@@ -386,7 +435,7 @@ func (a *App) StartApply() error {
 				payload["updated"] = updated
 			}
 		}
-		runtime.EventsEmit(a.ctx, "engine:applied", payload)
+		emitApplied(payload)
 		if len(written) > 0 {
 			a.emitStatus("加速已生效", "ok")
 		} else {
@@ -1163,6 +1212,10 @@ func (a *App) SetAutoStart(on bool) (map[string]any, error) {
 // SetAutoHeal 开关后台自动自愈（仅 Pro 可用），返回操作后的真实状态。
 // 前端必须用返回值渲染，杜绝「本地猜测状态」与后端不一致。
 func (a *App) SetAutoHeal(on bool) (map[string]any, error) {
+	started := time.Now()
+	defer func() {
+		a.logf("后台自愈: 切换为 %v 完成，耗时 %s", on, time.Since(started).Round(time.Millisecond))
+	}()
 	if !a.pro.Load() {
 		return a.proState(), errors.New("自动自愈是 Pro 功能，请先解锁")
 	}
@@ -1210,15 +1263,31 @@ func (a *App) startHeal(cfg *config.Config) {
 					continue // 上一轮还没跑完，跳过本周期
 				}
 				a.emitStatus("后台自愈: 正在巡检...", "busy")
-				_, _, _, err := engine.ApplyOnceOpts(cfg, guiReporter{a}, engine.Options{
-					GitLevel: a.gitLevel(),
-				})
-				a.busy.Store(false)
-				if err != nil {
-					a.emitStatus("后台自愈: "+err.Error(), "err")
-					continue
-				}
-				a.emitStatus("后台自愈: 巡检完成", "ok")
+				// 自愈循环是长驻协程：里面 panic 会把整个进程带走（用户看到的是
+				// 「软件自己没了」）。这里必须 recover，并把 busy 闸放回去，
+				// 否则下一个周期永远进不来。
+				func() {
+					defer func() {
+						if r := recover(); r != nil {
+							a.logf("后台自愈协程异常: %v", r)
+							a.emitStatus("后台自愈: 本轮巡检异常（已自动恢复）", "warn")
+						}
+						a.busy.Store(false)
+					}()
+					_, _, _, err := engine.ApplyOnceOpts(cfg, guiReporter{a}, engine.Options{
+						GitLevel: a.gitLevel(),
+					})
+					if err != nil {
+						if errors.Is(err, engine.ErrInconclusive) {
+							a.logf("后台自愈: 本轮证据不足，保持现有记录不动")
+							a.emitStatus("后台自愈: 网络较慢，本轮未完成验证（已保留现有记录）", "warn")
+							return
+						}
+						a.emitStatus("后台自愈: "+err.Error(), "err")
+						return
+					}
+					a.emitStatus("后台自愈: 巡检完成", "ok")
+				}()
 			}
 		}
 	}()
@@ -1262,6 +1331,12 @@ func normalizeDeepMode(mode string) string {
 // 「连不上」由代理层自己解决：连续握手被重置会自动降级成纯隧道，
 // 界面只显示「已开启 · 智能降级」，不弹任何红色错误。
 func (a *App) SetDeepAccel(on bool) (map[string]any, error) {
+	started := time.Now()
+	// 耗时日志：这个方法是「点开关没反应」投诉的第一嫌疑对象
+	//（要写注册表、要广播 WM_SETTINGCHANGE），有没有拖住 UI 靠日志说话。
+	defer func() {
+		a.logf("深度加速: 切换为 %v 完成，耗时 %s", on, time.Since(started).Round(time.Millisecond))
+	}()
 	if !a.pro.Load() {
 		return a.proState(), errors.New("深度网页加速是 Pro 功能，请先解锁")
 	}

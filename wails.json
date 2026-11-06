@@ -11,7 +11,7 @@
   },
   "info": {
     "productName": "ghsmart",
-    "productVersion": "1.0.9",
+    "productVersion": "1.0.10",
     "copyright": "Copyright © 2026",
     "comments": "GitHub 访问智能优选（纯本地 DoH + 探测 + Hosts）"
   }
