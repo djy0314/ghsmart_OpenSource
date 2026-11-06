@@ -231,7 +231,7 @@
     <h1>ghsmart</h1>
     <!-- 兜底文本只写版本号、不写 Free/Pro：真实授权状态由后端 proState 给，
          在它回来之前谎称「Free」会让已付费用户看到一闪而过的错信息 -->
-    <span class="ver" id="ver-text">v1.0.10</span>
+    <span class="ver" id="ver-text">v1.0.11</span>
     <!-- 有新版本时才出现：点徽标去下载页，点 × 表示「这个版本先不管」 -->
     <span id="update-wrap">
       <button id="update-badge" type="button" title="发现新版本，点击查看下载页">新版本</button>
@@ -337,8 +337,37 @@
 
   <script>
     // ===== 基础引用 =====
-    const { EventsOn } = window.runtime;
-    const app = window.go.main.App;
+    // Wails 的运行时/绑定注入可能晚于页面脚本。早期版本在顶层把绑定读成常量
+    // （直接读 window.go.main.App），那一刻绑定没到，常量就永远是 undefined，
+    // 所有按钮都会报 "Cannot read properties of undefined"（v1.0.11 实机事故）。
+    // 现在：按需取值 + 启动轮询 + 按能力识别绑定对象（混淆可能改掉 App 这个名字）。
+    const RT = window.runtime || {};
+    const EventsOn = (typeof RT.EventsOn === "function")
+      ? RT.EventsOn.bind(RT) : () => () => {};
+    function findApp() {
+      const g = window.go;
+      if (!g) return null;
+      if (g.main && g.main.App && typeof g.main.App.StartApply === "function") return g.main.App;
+      // 混淆后绑定对象名可能不叫 App：按能力找，认 StartApply + GetProState 两个方法。
+      for (const pkg of Object.keys(g)) {
+        const p = g[pkg];
+        if (!p || typeof p !== "object") continue;
+        for (const name of Object.keys(p)) {
+          const o = p[name];
+          if (o && typeof o.StartApply === "function" && typeof o.GetProState === "function") return o;
+        }
+      }
+      return null;
+    }
+    function backend() {
+      const a = findApp();
+      if (!a) {
+        const msg = "后端尚未就绪，请稍候再点；若一直如此请重启软件";
+        try { toast("⚠️ " + msg, "err"); } catch (_) {}
+        throw new Error(msg);
+      }
+      return a;
+    }
     const $ = (id) => document.getElementById(id);
     const dot = $("status-dot"), statusText = $("status-text");
     const results = $("results"), goBtn = $("go-btn");
@@ -620,7 +649,7 @@
         if (deepCloseTimer) { clearTimeout(deepCloseTimer); deepCloseTimer = null; }
         // 后端把系统代理彻底还原了（这是关闭流程的「真正完成」时刻）。
         // 用后端权威状态收尾：万一用户刚才又点开了，就别拿这条旧事件覆盖界面。
-        withTimeout(app.GetProState(), 8000, "读取状态").then((st) => {
+        withTimeout(backend().GetProState(), 8000, "读取状态").then((st) => {
           renderState(st);
           if (st.deepAccel) return;
           if (d && d.err) {
@@ -730,24 +759,24 @@
         toast("⚠️ " + msg, "err");
         if (statusText) statusText.textContent = msg;
         // 失败/超时后必须回读后端真实状态，不能让界面停在「我以为的样子」
-        try { renderState(await withTimeout(app.GetProState(), 5000, "读取状态")); } catch (_) {}
+        try { renderState(await withTimeout(backend().GetProState(), 5000, "读取状态")); } catch (_) {}
       } finally {
         el.style.pointerEvents = "";
       }
     }
     $("autostart-toggle").addEventListener("click", () =>
-      toggleOpt($("autostart-toggle"), (on) => app.SetAutoStart(on)));
+      toggleOpt($("autostart-toggle"), (on) => backend().SetAutoStart(on)));
     $("cliproxy-toggle").addEventListener("click", () =>
-      toggleOpt($("cliproxy-toggle"), (on) => app.SetCLIProxyEnv(on)));
+      toggleOpt($("cliproxy-toggle"), (on) => backend().SetCLIProxyEnv(on)));
     $("githttps-toggle").addEventListener("click", () =>
-      toggleOpt($("githttps-toggle"), (on) => app.SetGitHTTPS(on)));
+      toggleOpt($("githttps-toggle"), (on) => backend().SetGitHTTPS(on)));
 
     // ===== 新版本徽标 =====
     // 点徽标 = 去下载页（客户想要的下一步）；点 × = 这个版本先不管（持久记住）
     $("update-badge").addEventListener("click", async (e) => {
       e.stopPropagation();
       try {
-        await withTimeout(app.OpenReleasePage(), 8000, "打开下载页");
+        await withTimeout(backend().OpenReleasePage(), 8000, "打开下载页");
         toast("已在浏览器打开下载页", "ok");
       } catch (err) {
         toast("打开下载页失败：" + ((err && err.message) || err), "err");
@@ -756,7 +785,7 @@
     $("update-skip").addEventListener("click", async (e) => {
       e.stopPropagation();
       try {
-        const s = await withTimeout(app.SkipUpdate(), 8000, "跳过版本");
+        const s = await withTimeout(backend().SkipUpdate(), 8000, "跳过版本");
         renderUpdate(s); // 用后端返回值收徽标，不在前端猜
         toast("已跳过这个版本，之后不再提示", "ok");
       } catch (err) {
@@ -767,14 +796,33 @@
     $("conflict-bar").addEventListener("click", () =>
       $("conflict-bar").classList.remove("show"));
 
-    // ===== 启动初始化 =====
-    app.IsElevated().then((v) => { if (v) $("admin-badge").style.display = "inline"; });
-    app.GetAppliedEntries().then((m) => {
-      const n = Object.keys(m || {}).length;
-      setAppliedInfo(n);
-      if (n > 0) setStatus("加速已生效", "ok");
-    });
-    app.GetProState().then(renderState);
+    // ===== 启动初始化：绑定真正到位后再拉后端数据 =====
+    (async function boot() {
+      const deadline = Date.now() + 12000;
+      while (!findApp() && Date.now() < deadline) {
+        await new Promise((r) => setTimeout(r, 100));
+      }
+      const a = findApp();
+      if (!a) {
+        const g = window.go || {};
+        const names = [];
+        for (const pkg of Object.keys(g)) {
+          try { names.push(pkg + ":[" + Object.keys(g[pkg] || {}).join(",") + "]"); } catch (_) {}
+        }
+        const detail = names.length ? names.join(" ") : "window.go 为空";
+        setStatus("后端未就绪（" + detail + "），请关闭后重新以管理员身份运行", "err");
+        toast("⚠️ 后端连接失败，请重启软件", "err");
+        return;
+      }
+      setStatus("后端已连接，点击上方按钮开始探测", "");
+      try { a.IsElevated().then((v) => { if (v) $("admin-badge").style.display = "inline"; }).catch(() => {}); } catch (_) {}
+      try { a.GetAppliedEntries().then((m) => {
+        const n = Object.keys(m || {}).length;
+        setAppliedInfo(n);
+        if (n > 0) setStatus("加速已生效", "ok");
+      }).catch(() => {}); } catch (_) {}
+      try { a.GetProState().then(renderState).catch(() => {}); } catch (_) {}
+    })();
 
     // ===== 一键加速 =====
     // 每一次点击都必须有明确结果：要么真的开跑（后端会回终态事件），
@@ -797,7 +845,7 @@
 
       let kicked = false;
       try {
-        await withTimeout(app.StartApply(), 15000, "启动探测");
+        await withTimeout(backend().StartApply(), 15000, "启动探测");
         kicked = true; // 已开跑：解锁交给后端终态事件，不在这里放行
       } catch (e) {
         setStatus("加速失败", "err");
@@ -819,7 +867,7 @@
       // 还原要动注册表 + Hosts，被安全软件拦住时能停好几秒：给它 20 秒，
       // 超时就明说「没还原干净」，绝不假装成功、也绝不让窗口像死了一样。
       try {
-        await withTimeout(app.RemoveHosts(), 20000, "还原网络");
+        await withTimeout(backend().RemoveHosts(), 20000, "还原网络");
         // 成功路径由 engine:removed 事件统一渲染（含托盘触发），避免双写状态
       } catch (e) {
         toast("⚠️ " + String((e && e.message) || e), "err");
@@ -834,7 +882,7 @@
     // 打开解锁弹窗（仅在未激活时使用），顺带拉一次机器码
     function openProModal() {
       proMask.classList.add("show");
-      app.GetMachineCode().then((mc) => {
+      backend().GetMachineCode().then((mc) => {
         $("mc-code").textContent = mc;
         mcCopied = mc;
       }).catch((e) => { $("mc-code").textContent = "读取失败: " + e; });
@@ -845,7 +893,7 @@
       const el = $("pro-toggle");
       el.style.pointerEvents = "none";
       try {
-        const st = await withTimeout(app.GetProState(), 8000, "读取状态");
+        const st = await withTimeout(backend().GetProState(), 8000, "读取状态");
         if (!st.pro) {
           openProModal();
           return;
@@ -853,13 +901,13 @@
         // 以「后端当前状态取反」为目标，并用后端返回值渲染，
         // 不做任何本地状态猜测——这是开关能可靠关闭的前提
         const next = !st.autoHeal;
-        const st2 = await withTimeout(app.SetAutoHeal(next), 10000, "切换后台自愈");
+        const st2 = await withTimeout(backend().SetAutoHeal(next), 10000, "切换后台自愈");
         renderState(st2);
         toast(st2.autoHeal ? "⚡ 后台自动自愈已开启" : "后台自动自愈已关闭", "ok");
       } catch (e) {
         toast("⚠️ " + String((e && e.message) || e), "err");
         // 超时/失败后回读真实状态，避免界面撒谎
-        try { renderState(await withTimeout(app.GetProState(), 5000, "读取状态")); } catch (_) {}
+        try { renderState(await withTimeout(backend().GetProState(), 5000, "读取状态")); } catch (_) {}
       } finally {
         el.style.pointerEvents = "";
       }
@@ -891,10 +939,10 @@
       if (Date.now() - deepClosedAt < 500) { toast("正在关闭中，请稍候…", ""); return; }
       let st;
       try {
-        st = await withTimeout(app.GetProState(), 8000, "读取状态");
+        st = await withTimeout(backend().GetProState(), 8000, "读取状态");
       } catch (e) {
         toast("⚠️ " + String((e && e.message) || e), "err");
-        try { renderState(await withTimeout(app.GetProState(), 5000, "读取状态")); } catch (_) {}
+        try { renderState(await withTimeout(backend().GetProState(), 5000, "读取状态")); } catch (_) {}
         return;
       }
       if (!st.pro) {
@@ -914,10 +962,10 @@
         toast("正在清理网络环境...", "");
         // 后端 stopDeep 的同步段是微秒级（摘状态 + 放端口），还原动作在后台跑。
         // 这里仍然不 await：网络再差也不该让开关等着。
-        app.SetDeepAccel(false).catch((e) => {
+        backend().SetDeepAccel(false).catch((e) => {
           // 请求本身失败（极少见：后端拒绝/桥接异常）→ 以后端真实状态为准
           toast("清理请求失败：" + String(e), "err");
-          withTimeout(app.GetProState(), 5000, "读取状态").then(renderState).catch(() => {});
+          withTimeout(backend().GetProState(), 5000, "读取状态").then(renderState).catch(() => {});
         });
         // 关闭是异步的：deep:closed 才是「真的关掉了」。但事件也可能因为
         // 后端卡住而不来 —— 12 秒没收到就回读一次真实状态并说明，
@@ -925,7 +973,7 @@
         if (deepCloseTimer) clearTimeout(deepCloseTimer);
         deepCloseTimer = setTimeout(async () => {
           try {
-            const real = await withTimeout(app.GetProState(), 5000, "读取状态");
+            const real = await withTimeout(backend().GetProState(), 5000, "读取状态");
             renderState(real);
             if (real.deepAccel) {
               setStatus("深度加速仍在开启（关闭未完成），可再点一次", "warn");
@@ -940,7 +988,7 @@
       deepBusy = true;
       setStatus("正在开启深度加速...", "busy");
       try {
-        const st2 = await withTimeout(app.SetDeepAccel(true), 15000, "开启深度加速");
+        const st2 = await withTimeout(backend().SetDeepAccel(true), 15000, "开启深度加速");
         renderState(st2);
         hideHint();
         setStatus("深度加速已开启", "ok");
@@ -949,7 +997,7 @@
         toast(String(e), "err");
         setStatus("深度加速开启失败", "err");
         // 失败时以后端真实状态为准，避免界面比后端乐观
-        try { renderState(await withTimeout(app.GetProState(), 5000, "读取状态")); } catch (_) {}
+        try { renderState(await withTimeout(backend().GetProState(), 5000, "读取状态")); } catch (_) {}
       } finally {
         deepBusy = false;
       }
@@ -977,7 +1025,7 @@
       msg.className = "";
       msg.textContent = "正在离线验签...";
       try {
-        await app.ActivatePro($("pro-key").value);
+        await backend().ActivatePro($("pro-key").value);
         msg.className = "ok";
         msg.textContent = "✓ 验签通过，Pro 已解锁";
         toast("⚡ Pro 已解锁", "ok");
@@ -995,14 +1043,14 @@
     $("clear-lic").addEventListener("click", async () => {
       let st;
       try {
-        st = await withTimeout(app.GetProState(), 8000, "读取状态");
+        st = await withTimeout(backend().GetProState(), 8000, "读取状态");
       } catch (e) {
         toast("⚠️ " + String((e && e.message) || e), "err");
         return;
       }
       if (!st.pro) { toast("当前未激活，无需清除", "warn"); return; }
       try {
-        await withTimeout(app.ClearLicense(), 8000, "清除授权");
+        await withTimeout(backend().ClearLicense(), 8000, "清除授权");
         // renderState(false) 由 engine:state 事件统一刷新
         toast("已清除授权，回到 Free 版", "ok");
       } catch (e) {

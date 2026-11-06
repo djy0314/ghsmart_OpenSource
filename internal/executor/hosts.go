@@ -105,7 +105,37 @@ func renderBlock(entries map[string]string) string {
 
 // writeHostsAtomic 用「临时文件 + 重命名」方式写入 Hosts；
 // Windows 下若重命名失败（目标被占用等），回退为直接覆盖并返回提示。
+//
+// ★ 为什么要重试（v1.0.11 实机事故）：
+// 一键加速会写两次 Hosts——主域名探测成功时先写一次让用户秒生效，收尾再全量写一次。
+// 实测第二写入会偶发失败：安全软件正在扫描刚刚变动的 hosts、或 DNS 客户端握着句柄，
+// 重命名与直接覆盖同时被拒（日志里目录 mtime 更新了、hosts 本体却没更新，就是这一下）。
+// 以前失败只往上抛错误、不重试也不写日志，用户看到的是「按钮点了没反应 / 报错」，
+// 而磁盘上其实还留着第一次的半套记录——最难查的一类现场。
+// 现在：最多尝试 3 次，间隔 150ms/300ms，给扫描器让路；仍失败才报错，且错误带尝试次数。
 func writeHostsAtomic(path string, content []byte) (fallbackNote string, err error) {
+	const attempts = 3
+	var lastErr error
+	for i := 1; i <= attempts; i++ {
+		note, e := writeHostsOnce(path, content)
+		if e == nil {
+			if i > 1 {
+				return note, nil // 重试成功：对用户就是成功，不必惊动
+			}
+			return note, nil
+		}
+		lastErr = e
+		if i < attempts {
+			// 第一次 150ms、第二次 300ms：给实时扫描/句柄释放留窗口
+			time.Sleep(time.Duration(i) * 150 * time.Millisecond)
+		}
+	}
+	return "", fmt.Errorf("%w（已自动重试 %d 次仍失败，通常是安全软件正在占用 hosts 文件，请稍后再点一次）",
+		lastErr, attempts)
+}
+
+// writeHostsOnce 是单次写入尝试：先原子重命名，失败回退直接覆盖。
+func writeHostsOnce(path string, content []byte) (fallbackNote string, err error) {
 	tmp := path + ".ghsmart.tmp"
 	if err := os.WriteFile(tmp, content, 0o644); err != nil {
 		return "", fmt.Errorf("写临时文件失败: %w", err)

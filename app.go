@@ -104,7 +104,7 @@ type App struct {
 //
 // 发版时必须与外面前端 index.html 的两处显示、wails.json 的 productVersion、
 // README 一并同步——漏一处就会出现「检测到新版本 1.0.9，但界面写着 1.0.8」。
-const appVersion = "1.0.10"
+const appVersion = "1.0.11"
 
 // NewApp 创建应用实例。
 func NewApp() *App {
@@ -404,6 +404,10 @@ func (a *App) StartApply() error {
 			return
 		}
 		if err != nil {
+			// ★ 绝不能静默失败：这一条是 v1.0.11 现场复盘补上的。
+			// 上一版这里只往界面发事件、不写日志，结果「日志显示写入 4 条、hosts 里却只有 1 行」
+			// 这种最要命的现场在日志里查不到任何原因（实际是收尾那次写盘被安全软件占了句柄）。
+			a.logf("一键加速失败：探测到 %d 个域名可用 IP，但落盘未成功：%v", len(written), err)
 			emitApplied(map[string]any{
 				"ok": false, "lines": lines, "written": 0, "error": err.Error(),
 			})
